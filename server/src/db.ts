@@ -352,9 +352,23 @@ function seedModels(s: Store) {
 let store: Store = emptyStore()
 let ready = false
 
+/** 裁剪 usage_logs 和 ledger，保留最近 N 条，防止 store 无限增长导致 OOM */
+function pruneStoreArrays() {
+  const MAX_USAGE_LOGS = 5000
+  const MAX_LEDGER = 10000
+  if (store.usage_logs.length > MAX_USAGE_LOGS) {
+    store.usage_logs.splice(0, store.usage_logs.length - MAX_USAGE_LOGS)
+  }
+  if (store.ledger.length > MAX_LEDGER) {
+    store.ledger.splice(0, store.ledger.length - MAX_LEDGER)
+  }
+}
+
 export async function initDb() {
   const raw = await loadStoreRaw()
   store = parseStore(raw)
+  // 裁剪过大的 usage_logs 和 ledger，防止 OOM
+  pruneStoreArrays()
   // 新库、或 migrate 修复了脏 id 等字段时落盘
   await save(store)
   ready = true
@@ -398,6 +412,7 @@ export const db = {
   reload: async () => {
     const raw = await loadStoreRaw()
     store = parseStore(raw)
+    pruneStoreArrays()
   },
   nextId,
   async transaction<T>(fn: () => T): Promise<T> {
