@@ -103,8 +103,18 @@ export async function setUserBalance(
       operator_id: operatorId ?? null,
       created_at: now(),
     })
+    pruneLedger()
     return u
   })
+}
+
+/** 裁剪 ledger：保留最近 10000 条，防止 store 无限增长导致 OOM */
+function pruneLedger() {
+  const MAX_LEDGER = 10000
+  const ledger = db.getStore().ledger
+  if (ledger.length > MAX_LEDGER) {
+    ledger.splice(0, ledger.length - MAX_LEDGER)
+  }
 }
 
 export function centsToYuan(cents: number): number {
@@ -135,6 +145,7 @@ export async function creditUser(
       operator_id: operatorId ?? null,
       created_at: now(),
     })
+    pruneLedger()
     return u
   })
 }
