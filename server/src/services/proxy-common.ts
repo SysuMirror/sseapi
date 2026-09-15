@@ -32,6 +32,15 @@ export function anthropicAuthHeader(model: ModelRow): Record<string, string> {
   return h
 }
 
+/** 透传给上游的 session/来源 header，让下游 LB（如 gpt-proxy）能按用户区分 session */
+export function upstreamSessionHeaders(req: AuthedRequest): Record<string, string> {
+  const h: Record<string, string> = {}
+  if (req.user?.id) h['X-Session-Id'] = `u${req.user.id}`
+  const xff = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || ''
+  if (xff) h['X-Forwarded-For'] = String(xff).split(',')[0].trim()
+  return h
+}
+
 /** 统一取上游地址：优先该协议独立 base，否则回退 OpenAI 上游 */
 export function upstreamBaseFor(protocol: 'openai' | 'anthropic' | 'responses', model: ModelRow): string {
   if (protocol === 'anthropic') return String(model.anthropic_base_url || model.upstream_base_url || '').replace(/\/$/, '')
@@ -382,6 +391,7 @@ export async function forwardJsonProxy(
       headers: {
         'Content-Type': 'application/json',
         ...upstreamAuthHeader(model),
+        ...upstreamSessionHeaders(req),
       },
       body: JSON.stringify(payload),
     })
