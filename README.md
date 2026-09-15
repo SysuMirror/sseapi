@@ -60,3 +60,5 @@ curl https://api.ssemarket.cn/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen2-7b","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+<!-- auto-deploy test 1789473180 -->
