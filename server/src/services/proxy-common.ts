@@ -1,4 +1,5 @@
 import type { Response } from 'express'
+import { createHash } from 'crypto'
 import { db, now, type ModelRow } from '../db.js'
 import type { AuthedRequest } from '../middleware/auth.js'
 import { calcCostCents, creditUser } from '../services/users.js'
@@ -32,10 +33,47 @@ export function anthropicAuthHeader(model: ModelRow): Record<string, string> {
   return h
 }
 
-/** 透传给上游的 session/来源 header，让下游 LB（如 gpt-proxy）能按用户区分 session */
+/** 从请求体提取首条 user 文本，用于标识 conversation */
+function firstUserText(body: unknown): string {
+  if (!body || typeof body !== 'object') return ''
+  const b = body as Record<string, unknown>
+  // chat / messages: 取第一条 user message
+  const messages = b.messages
+  if (Array.isArray(messages)) {
+    for (const m of messages) {
+      if (!m || typeof m !== 'object') continue
+      const msg = m as Record<string, unknown>
+      if (msg.role !== 'user') continue
+      if (typeof msg.content === 'string') return msg.content
+      if (Array.isArray(msg.content)) {
+        const t = (msg.content as unknown[])
+          .map(c => c && typeof c === 'object' ? String((c as { text?: unknown }).text ?? '') : '')
+          .join('')
+        if (t) return t
+      }
+    }
+  }
+  // embedding
+  if (b.input != null) return String(b.input)
+  // rerank
+  if (b.query != null) return String(b.query)
+  // 兜底
+  if (b.prompt != null) return String(b.prompt)
+  return ''
+}
+
+/** 透传给上游的 session/来源 header，让下游 LB（如 gpt-proxy）能按 conversation 区分 session */
 export function upstreamSessionHeaders(req: AuthedRequest): Record<string, string> {
   const h: Record<string, string> = {}
-  if (req.user?.id) h['X-Session-Id'] = `u${req.user.id}`
+  // 按对话分:哈希首条 user message → 不同对话不同 session，同对话绑同 key（cache 友好）
+  const text = firstUserText(req.body)
+  if (text) {
+    const hash = createHash('md5').update(text.slice(0, 500)).digest('hex').slice(0, 12)
+    h['X-Session-Id'] = `conv-${hash}`
+  } else if (req.user?.id) {
+    // 无消息体（如 /v1/models）:用 userId 兜底
+    h['X-Session-Id'] = `u${req.user.id}`
+  }
   const xff = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || ''
   if (xff) h['X-Forwarded-For'] = String(xff).split(',')[0].trim()
   return h
