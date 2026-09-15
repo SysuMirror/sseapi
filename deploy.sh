@@ -106,4 +106,4 @@ export SSEAPI_FRONTEND_DIST="${SSEAPI_FRONTEND_DIST:-$ROOT/web/dist}"
 export NODE_ENV=production
 cd server
 echo "[deploy] starting node dist/index.js"
-exec node dist/index.js
+exec node --max-old-space-size=3072 dist/index.js
