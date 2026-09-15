@@ -46,6 +46,16 @@ export const api = {
   balance: () => http.get<any>('api/billing/balance'),
   billingSummary: () => http.get<any>('api/billing/summary'),
   ledger: (page = 1) => http.get<any>(`api/billing/ledger?page=${page}`),
+  checkinStatus: () => http.get<{ checkedIn: boolean; rewardYuan: number }>('api/billing/checkin'),
+  checkin: () =>
+    http.post<{
+      checkedIn: boolean
+      already: boolean
+      rewardYuan: number
+      balanceCents?: number
+      balanceYuan?: number
+      message?: string
+    }>('api/billing/checkin'),
 
   models: () => http.get<any[]>('api/models'),
   docs: () =>

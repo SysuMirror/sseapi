@@ -22,6 +22,27 @@
       </div>
     </div>
 
+    <div class="checkin-card" :class="{ done: checkinDone }">
+      <div class="checkin-info">
+        <div class="checkin-icon">{{ checkinDone ? '✓' : '🎁' }}</div>
+        <div>
+          <div class="checkin-title">{{ checkinDone ? '今日已签到' : '每日签到' }}</div>
+          <div class="checkin-desc">
+            {{ checkinDone ? '明天再来吧～' : '签到领取 ¥10 余额，每天一次' }}
+          </div>
+        </div>
+      </div>
+      <button
+        class="btn checkin-btn"
+        :disabled="checkinDone || checkinLoading"
+        @click="doCheckin"
+      >
+        <span v-if="checkinLoading">签到中…</span>
+        <span v-else-if="checkinDone">已签到</span>
+        <span v-else>签到 +¥10</span>
+      </button>
+    </div>
+
     <div class="grid">
       <div class="card panel">
         <div class="panel-h">
@@ -66,6 +87,8 @@ import { openDocs } from '../store/docs'
 
 const days = ref(30)
 const summary = ref<any>(null)
+const checkinDone = ref(false)
+const checkinLoading = ref(false)
 
 const bars = computed(() => {
   const list = summary.value?.byDay || []
@@ -87,6 +110,29 @@ async function load() {
   if (summary.value?.balanceCents != null) {
     patchUser({ balanceCents: summary.value.balanceCents })
   }
+  try {
+    const st = await api.checkinStatus()
+    checkinDone.value = st.checkedIn
+  } catch {
+    /* ignore */
+  }
+}
+
+async function doCheckin() {
+  if (checkinDone.value || checkinLoading.value) return
+  checkinLoading.value = true
+  try {
+    const r = await api.checkin()
+    checkinDone.value = true
+    if (r.balanceCents != null) {
+      patchUser({ balanceCents: r.balanceCents })
+      if (summary.value) summary.value.balanceCents = r.balanceCents
+    }
+  } catch {
+    /* ignore - toast handled by http layer */
+  } finally {
+    checkinLoading.value = false
+  }
 }
 
 onMounted(load)
@@ -98,6 +144,47 @@ onMounted(load)
   grid-template-columns: repeat(4, 1fr);
   gap: var(--sp-4);
   margin-bottom: var(--sp-4);
+}
+.checkin-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-4) var(--sp-5);
+  margin-bottom: var(--sp-4);
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: linear-gradient(135deg, #f0f5ff 0%, #faf0ff 100%);
+  gap: var(--sp-4);
+}
+.checkin-card.done {
+  background: var(--n-50);
+}
+.checkin-info {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.checkin-icon {
+  font-size: 28px;
+  line-height: 1;
+}
+.checkin-title {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  color: var(--ink-strong);
+}
+.checkin-desc {
+  font-size: var(--fs-sm);
+  color: var(--ink-soft);
+  margin-top: 2px;
+}
+.checkin-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.checkin-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .stat {
   padding: var(--sp-5);

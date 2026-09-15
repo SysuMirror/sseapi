@@ -1,7 +1,23 @@
 import { Router } from 'express'
 import { db } from '../db.js'
 import { authJwt, ok, type AuthedRequest } from '../middleware/auth.js'
-import { centsToYuan } from '../services/users.js'
+import { centsToYuan, creditUser } from '../services/users.js'
+
+/** 每日签到奖励（分）：10 元 */
+const CHECKIN_REWARD_CENTS = 1000
+
+function todayStr(): string {
+  return new Date().toISOString().slice(0, 10) // YYYY-MM-DD
+}
+
+function hasCheckedInToday(userId: number): boolean {
+  const today = todayStr()
+  return db
+    .getStore()
+    .ledger.some(
+      (l) => l.user_id === userId && l.kind === 'checkin' && l.created_at.startsWith(today),
+    )
+}
 
 export const billingRouter = Router()
 billingRouter.use(authJwt)
@@ -34,6 +50,41 @@ billingRouter.get('/balance', (req: AuthedRequest, res) => {
   ok(res, {
     balanceCents: req.user!.balance_cents,
     balanceYuan: centsToYuan(req.user!.balance_cents),
+  })
+})
+
+/** 查询今日签到状态 */
+billingRouter.get('/checkin', (req: AuthedRequest, res) => {
+  ok(res, {
+    checkedIn: hasCheckedInToday(req.user!.id),
+    rewardYuan: CHECKIN_REWARD_CENTS / 100,
+  })
+})
+
+/** 每日签到：每天一次，奖励 10 元余额 */
+billingRouter.post('/checkin', async (req: AuthedRequest, res) => {
+  const userId = req.user!.id
+  if (hasCheckedInToday(userId)) {
+    ok(res, {
+      checkedIn: true,
+      already: true,
+      rewardYuan: CHECKIN_REWARD_CENTS / 100,
+      message: '今日已签到',
+    })
+    return
+  }
+  const user = await creditUser(
+    userId,
+    CHECKIN_REWARD_CENTS,
+    'checkin',
+    '每日签到奖励',
+  )
+  ok(res, {
+    checkedIn: true,
+    already: false,
+    rewardYuan: CHECKIN_REWARD_CENTS / 100,
+    balanceCents: user.balance_cents,
+    balanceYuan: centsToYuan(user.balance_cents),
   })
 })
 
