@@ -23,6 +23,7 @@ import {
   anthropicAuthHeader,
   upstreamAuthHeader,
   upstreamBaseFor,
+  upstreamSessionHeaders,
   anthropicMessagesUrl,
   responsesUrl,
 } from '../services/proxy-common.js'
@@ -336,7 +337,7 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
     })
   } catch (e) {
@@ -490,7 +491,7 @@ proxyRouter.post('/embeddings', authApiKey, async (req: AuthedRequest, res) => {
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
     })
   } catch (e) {
@@ -579,7 +580,7 @@ proxyRouter.post('/rerank', authApiKey, async (req: AuthedRequest, res) => {
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
     })
   } catch (e) {
@@ -803,6 +804,7 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
         headers: {
           'content-type': 'application/json',
           ...anthropicAuthHeader(model),
+          ...upstreamSessionHeaders(req),
         },
         body: JSON.stringify(payloadProxy),
       })
@@ -987,7 +989,7 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
     })
   } catch (e) {
@@ -1305,7 +1307,7 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     try {
       upstreamRes = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+        headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
         body: JSON.stringify(payloadProxy),
       })
     } catch (e) {
@@ -1453,7 +1455,7 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model) },
+      headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
     })
   } catch (e) {
