@@ -51,10 +51,9 @@ else
 fi
 
 # 若包内有 server/.env，补缺（不覆盖已 export / 平台注入的键）
-if [ -f "$ROOT/server/.env" ]; then
+if [ -f "/server/.env" ]; then
   set -a
-  # shellcheck disable=SC1091
-  . "$ROOT/server/.env" || true
+  source <(tr -d "" < "/server/.env") || true
   set +a
 fi
 npm_ci_or_install() {
