@@ -57,9 +57,16 @@ if [ -f "/server/.env" ]; then
   set +a
 fi
 npm_ci_or_install() {
+  # 自愈:清掉上次 npm 中断留下的 rename 临时目录(.esbuild-XXXX 等),
+  # 否则 npm ci 报 ENOTEMPTY 反复崩溃,supervisord 重试耗尽后 FATAL(502 根因)
+  find node_modules -maxdepth 1 -name '.*-*' -type d -exec rm -rf {} + 2>/dev/null || true
   # 强制带上 devDependencies，避免 NODE_ENV/omit=dev 干扰
   if [ -f package-lock.json ]; then
-    npm ci --include=dev
+    npm ci --include=dev || {
+      echo "[deploy] npm ci 失败,清空 node_modules 重试一次"
+      rm -rf node_modules
+      npm ci --include=dev
+    }
   else
     npm install --include=dev
   fi
@@ -76,7 +83,8 @@ if [ -f server/package.json ]; then
   else
     echo "[deploy] server/dist 已存在，跳过 tsc；仅安装生产依赖"
     cd server
-    npm ci --omit=dev 2>/dev/null || npm install --omit=dev
+    find node_modules -maxdepth 1 -name '.*-*' -type d -exec rm -rf {} + 2>/dev/null || true
+    npm ci --omit=dev 2>/dev/null || { rm -rf node_modules; npm ci --omit=dev 2>/dev/null; } || npm install --omit=dev
     cd "$ROOT"
   fi
   if [ ! -f server/dist/index.js ]; then

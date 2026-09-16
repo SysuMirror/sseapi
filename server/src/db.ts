@@ -301,7 +301,8 @@ function parseStore(raw: string | null): Store {
 }
 
 async function save(s: Store) {
-  await saveStoreRaw(JSON.stringify(s, null, 2))
+  // 紧凑序列化:带缩进会让 7MB 的 store 膨胀到 ~15MB 字符串,高频保存时内存翻倍
+  await saveStoreRaw(JSON.stringify(s))
 }
 
 function seedModels(s: Store) {

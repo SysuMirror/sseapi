@@ -109,14 +109,43 @@ export function localHistoryPath(table: keyof typeof HISTORY_OBJECT_KEYS): strin
 function uniqueHistory(rows: any[]): any[] {
   return [...new Map(rows.map((row) => [row.id, row])).values()].sort((a, b) => a.id - b.id)
 }
+
+// ── MinIO 同步去抖 ──
+// 之前每次 persist 都全量 PUT store + 全量读改写历史,大对象 PUT 反复超时(12s),
+// persist 队列堵塞导致内存堆积到 2GB OOM。本地文件才是持久化主路径,
+// MinIO 只是异地备份:本地写完立即返回,远端同步最多每 SYNC_MS 一次(尾沿触发)。
+const MINIO_SYNC_MS = Math.max(5_000, Number(process.env.SSEAPI_MINIO_SYNC_MS) || 30_000)
+const minioSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let minioSyncFailLogAt = 0
+
+function scheduleMinioSync(key: string, upload: () => Promise<void>): void {
+  if (!isMinioConfigured()) return
+  if (minioSyncTimers.has(key)) return // 已有待同步任务,尾沿定时器会带上最新内容
+  const timer = setTimeout(() => {
+    minioSyncTimers.delete(key)
+    upload().catch((e) => {
+      // 限流日志:每分钟最多一条,避免刷屏
+      if (Date.now() - minioSyncFailLogAt > 60_000) {
+        minioSyncFailLogAt = Date.now()
+        console.error('[sseapi] MinIO 同步失败(本地数据完好,稍后重试):', e instanceof Error ? e.message : e)
+      }
+      scheduleMinioSync(key, upload) // 失败后安排重试
+    })
+  }, MINIO_SYNC_MS)
+  timer.unref?.()
+  minioSyncTimers.set(key, timer)
+}
+
 export async function appendHistory(table: keyof typeof HISTORY_OBJECT_KEYS, rows: unknown[]): Promise<void> {
   if (!rows.length) return
-  const merged = uniqueHistory([...(await readHistory(table)), ...rows])
-  const content = merged.map((row) => JSON.stringify(row)).join('\n') + '\n'
+  // 纯追加:不再全量读取/合并/重写历史(旧实现 O(历史总量),是内存暴涨的主因)。
+  // 去重交给 readHistory(按 id),崩溃重放产生的重复行在读取时消解。
   fs.mkdirSync(config.dataDir, { recursive: true })
-  const p = localHistoryPath(table); const tmp = p + '.' + process.pid + '.tmp'
-  fs.writeFileSync(tmp, content); fs.renameSync(tmp, p)
-  if (isMinioConfigured()) await writeMinioHistory(table, content)
+  fs.appendFileSync(localHistoryPath(table), rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
+  scheduleMinioSync(`history:${table}`, async () => {
+    const content = fs.readFileSync(localHistoryPath(table), 'utf8')
+    await withTimeout(writeMinioHistory(table, content), 30_000)
+  })
 }
 export async function readHistory(table: keyof typeof HISTORY_OBJECT_KEYS): Promise<any[]> {
   const p = localHistoryPath(table)
@@ -153,17 +182,22 @@ export async function loadStoreRaw(): Promise<string | null> {
   return readLocal()
 }
 
-/** 持久化：先写本地（快），MinIO 异步尽力同步 */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      const t = setTimeout(() => reject(new Error('MinIO 写入超时')), ms)
+      t.unref?.()
+    }),
+  ])
+}
+
+/** 持久化：先写本地（同步、即时），MinIO 去抖异步备份 */
 export async function saveStoreRaw(content: string): Promise<void> {
   writeLocal(content)
   if (!isMinioConfigured()) return
-  const minioWrite = writeMinio(content)
-  const timeout = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error('MinIO 写入超时')), 12_000)
+  scheduleMinioSync('store', async () => {
+    // 上传时重读本地文件,拿到的是最新内容(去抖合并了多次保存)
+    await withTimeout(writeMinio(fs.readFileSync(localPath(), 'utf8')), 30_000)
   })
-  try {
-    await Promise.race([minioWrite, timeout])
-  } catch (e) {
-    console.error('[sseapi] MinIO 写入失败，已保留本地备份:', e instanceof Error ? e.message : e)
-  }
 }
