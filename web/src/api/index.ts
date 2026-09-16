@@ -1,6 +1,18 @@
 import { http } from './http'
 import type { User } from '../store/auth'
 
+export type RuntimeStatus = {
+  global: { current: number; limit: number; enabled: boolean }
+  users: { id: string; name: string; current: number; limit: number }[]
+  activeUsers: { id: string; name: string; current: number; limit: number }[]
+  models: { slug: string; current: number; limit: number }[]
+  endpoints: { name: string; current: number }[]
+  keys: { id: string; current: number; limit: number }[]
+  defaults: { rpm: number; maxConcurrent: number }
+  sampledAt?: string
+  scope?: 'process'
+}
+
 export const api = {
   loginUrl: () => http.get<{ authorize_url: string; state: string }>('api/auth/oauth/login-url'),
   oauthToken: (code: string, state: string) =>
@@ -73,7 +85,12 @@ export const api = {
   adminPatchUser: (id: number, body: Record<string, unknown>) =>
     http.patch(`api/admin/users/${id}`, body),
   adminRateLimits: () => http.get<any>('api/admin/rate-limits'),
-  adminRateLimitsStatus: () => http.get<any>('api/admin/rate-limits/status'),
+  adminRateLimitsStatus: (signal?: AbortSignal) =>
+    http.get<RuntimeStatus>('api/admin/rate-limits/status', {
+      signal,
+      timeout: 10000,
+      params: { _: Date.now() },
+    }),
   adminSaveRateLimits: (body: {
     enabled: boolean
     defaultRpm: number

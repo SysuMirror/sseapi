@@ -99,7 +99,7 @@ adminRouter.get('/users', (req, res) => {
   const q = String(req.query.q || '')
     .trim()
     .toLowerCase()
-  let rows = [...db.getStore().users].sort((a, b) => b.id - a.id).slice(0, 200)
+  let rows = [...db.getStore().users].sort((a, b) => b.id - a.id)
   if (q) {
     rows = rows.filter(
       (u) =>
@@ -109,18 +109,19 @@ adminRouter.get('/users', (req, res) => {
         (u.admin_note || '').toLowerCase().includes(q),
     )
   }
+  rows = rows.slice(0, 200)
   ok(res, rows.map((u) => publicUser(u, { admin: true })))
 })
 
-adminRouter.get('/users/:id', (req, res) => {
+adminRouter.get('/users/:id', async (req, res) => {
   const u = getUserById(Number(req.params.id))
   if (!u) {
     fail(res, 404, '用户不存在')
     return
   }
   const s = db.getStore()
-  const usage = s.usage_logs.filter((l) => l.user_id === u.id).slice(-50).reverse()
-  const ledger = s.ledger.filter((l) => l.user_id === u.id).slice(-50).reverse()
+  const usage = (await db.readUsageLogs()).filter((l) => l.user_id === u.id).slice(-50).reverse()
+  const ledger = (await db.readLedger()).filter((l) => l.user_id === u.id).slice(-50).reverse()
   const keys = s.api_keys
     .filter((k) => k.user_id === u.id)
     .map((k) => ({
@@ -895,10 +896,10 @@ adminRouter.put('/docs', async (req, res) => {
   ok(res, { title, externalUrl })
 })
 
-adminRouter.get('/stats', (_req, res) => {
+adminRouter.get('/stats', async (_req, res) => {
   const s = db.getStore()
   const from = Date.now() - 30 * 24 * 60 * 60 * 1000
-  const recent = s.usage_logs.filter((l) => new Date(l.created_at).getTime() >= from)
+  const recent = (await db.readUsageLogs()).filter((l) => new Date(l.created_at).getTime() >= from)
   const cost_cents = recent.reduce((a, l) => a + l.cost_cents, 0)
   const tokens = recent.reduce((a, l) => a + l.total_tokens, 0)
   const byModel: Record<string, { requests: number; tokens: number; costCents: number }> = {}
@@ -923,6 +924,7 @@ adminRouter.get('/rate-limits', (_req, res) => {
 })
 
 adminRouter.get('/rate-limits/status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   ok(res, getRuntimeStatus())
 })
 

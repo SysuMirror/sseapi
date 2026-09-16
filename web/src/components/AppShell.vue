@@ -2,7 +2,7 @@
   <div class="shell">
     <aside class="side">
       <div class="brand">
-        <img class="logo-mark" src="https://image.ssemarket.cn/i/images/2026/08/26/6420979e-abce-4fc6-9034-bcb86340ee59.png" alt="SSE Market" width="36" height="36" />
+        <img class="logo-mark" src="/logo.png" alt="SSE Market" width="36" height="36" />
         <div>
           <div class="brand-name">SSE_Market</div>
           <div class="brand-tag">API 开发平台</div>
@@ -48,6 +48,9 @@
             class="avatar avatar-img"
             :src="avatarUrl"
             alt=""
+            width="34"
+            height="34"
+            loading="lazy"
             referrerpolicy="no-referrer"
             @error="avatarBroken = true"
           />

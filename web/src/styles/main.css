@@ -28,7 +28,7 @@
   --ink: var(--n-900);
   --ink-strong: #0f1216;
   --ink-soft: var(--n-500);
-  --ink-faint: var(--n-400);
+  --ink-faint: var(--n-600);
   --line: var(--n-150);
   --line-strong: var(--n-200);
 
@@ -60,7 +60,7 @@
 
   /* —— 侧栏 —— */
   --sidebar: var(--n-0);
-  --sidebar-ink: var(--n-600);
+  --sidebar-ink: var(--n-700);
   --sidebar-hover: var(--n-75);
   --sidebar-active-bg: var(--brand-soft);
   --sidebar-active: var(--brand);

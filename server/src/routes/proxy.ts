@@ -152,9 +152,7 @@ function estimateEmbeddingTokens(input: unknown): number {
 
 proxyRouter.get('/models', authApiKey, async (req: AuthedRequest, res) => {
   if (!enforceRateLimits(req, res)) return
-  const releaseEndpoint = trackEndpoint('models')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
+  trackEndpoint('models', req, res)
   const canDev = await mayAccessDevOnly(req)
   const rows = db
     .getStore()
@@ -188,9 +186,6 @@ proxyRouter.get('/models', authApiKey, async (req: AuthedRequest, res) => {
 
 proxyRouter.get('/models/:modelId', authApiKey, async (req: AuthedRequest, res) => {
   if (!enforceRateLimits(req, res)) return
-  const releaseEndpoint = trackEndpoint('models')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
   const modelSlug = String(req.params.modelId || '').trim()
   if (!modelSlug) {
     res.status(400).json({ error: { message: 'model id 必填', type: 'invalid_request_error' } })
@@ -223,6 +218,7 @@ proxyRouter.get('/models/:modelId', authApiKey, async (req: AuthedRequest, res) 
     return
   }
 
+  trackEndpoint('models', req, res, modelSlug)
   const upstream = await resolveUpstreamModelEntry(model)
   res.json(mergeModelV1WithUpstream(model, upstream))
 })
@@ -236,9 +232,6 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
   }
 
   if (!enforceRateLimits(req, res, modelSlug)) return
-  const releaseEndpoint = trackEndpoint('chat/completions')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
 
   const model = db.getStore().models.find((m) => m.slug === modelSlug && m.enabled)
   if (!model) {
@@ -314,6 +307,7 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
     return
   }
   req.user = fresh
+  trackEndpoint('chat/completions', req, res, modelSlug)
 
   const upstreamModel = model.upstream_model || model.slug
   const base = String(model.upstream_base_url).replace(/\/$/, '')
@@ -466,9 +460,7 @@ proxyRouter.post('/embeddings', authApiKey, async (req: AuthedRequest, res) => {
   const modelSlug = String(body.model || '')
   const model = await resolveModelForProxy(req, res, modelSlug, 'embedding')
   if (!model) return
-  const releaseEndpoint = trackEndpoint('embeddings')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
+  trackEndpoint('embeddings', req, res, modelSlug)
 
   let urlPath: string
   let payload: Record<string, unknown>
@@ -554,9 +546,7 @@ proxyRouter.post('/rerank', authApiKey, async (req: AuthedRequest, res) => {
   const modelSlug = String(body.model || '')
   const model = await resolveModelForProxy(req, res, modelSlug, 'rerank')
   if (!model) return
-  const releaseEndpoint = trackEndpoint('rerank')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
+  trackEndpoint('rerank', req, res, modelSlug)
 
   let urlPath: string
   let payload: Record<string, unknown>
@@ -642,9 +632,7 @@ proxyRouter.post('/images/generations', authApiKey, async (req: AuthedRequest, r
   const modelSlug = String(body.model || '')
   const model = await resolveModelForProxy(req, res, modelSlug, 'image_generation')
   if (!model) return
-  const releaseEndpoint = trackEndpoint('images/generations')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
+  trackEndpoint('images/generations', req, res, modelSlug)
 
   await forwardJsonProxy(
     req,
@@ -694,9 +682,6 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
   }
 
   if (!enforceRateLimits(req, res, modelSlug)) return
-  const releaseEndpoint = trackEndpoint('messages')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
 
   const model = db.getStore().models.find((m) => m.slug === modelSlug && m.enabled)
   if (!model) {
@@ -786,6 +771,7 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
     return
   }
   req.user = fresh
+  trackEndpoint('messages', req, res, modelSlug)
 
   const upstreamModel = model.upstream_model || model.slug
 
@@ -1207,9 +1193,6 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     return
   }
   if (!enforceRateLimits(req, res, modelSlug)) return
-  const releaseEndpoint = trackEndpoint('responses')
-  res.once('close', releaseEndpoint)
-  res.once('finish', releaseEndpoint)
 
   const model = db.getStore().models.find((m) => m.slug === modelSlug && m.enabled)
   if (!model) {
@@ -1292,6 +1275,7 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     return
   }
   req.user = fresh
+  trackEndpoint('responses', req, res, modelSlug)
 
   const upstreamModel = model.upstream_model || model.slug
 

@@ -4,7 +4,7 @@
     <main class="stage">
       <img
         class="logo"
-        src="https://image.ssemarket.cn/i/images/2026/08/26/6420979e-abce-4fc6-9034-bcb86340ee59.png"
+        src="/logo.png"
         alt="SSE Market"
         width="88"
         height="88"

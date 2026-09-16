@@ -26,7 +26,7 @@
         <div><span>30 日消费</span><strong>¥{{ stats.last30d.costYuan.toFixed(2) }}</strong></div>
       </div>
       <div v-if="stats?.byModel && Object.keys(stats.byModel).length" class="by-model">
-        <h4>近 30 日按模型</h4>
+        <h2>近 30 日按模型</h2>
         <table class="table">
           <thead>
             <tr>
@@ -78,7 +78,7 @@
 
       <div class="runtime-panel">
         <div class="row-between">
-          <h4>实时并发状态</h4>
+          <h2>实时并发状态</h2>
           <div class="runtime-controls">
             <label class="toggle">
               <input type="checkbox" v-model="runtimeAutoRefresh" @change="onRuntimeAutoRefresh" />
@@ -87,17 +87,24 @@
             <button class="btn btn-ghost" type="button" :disabled="runtimeLoading" @click="loadRuntimeStatus">刷新</button>
           </div>
         </div>
-        <p class="hint">实时展示当前在处理中的请求（不含已完成的）。「上限 0」表示该层不限；模型并发会被名下用户/密钥的并发上限压住（三者取小）。</p>
+        <p class="hint">展示当前进程内处理中的请求，不含已完成请求；不是跨实例汇总。用户/模型上限 0 表示该层不限，实际请求仍受其他适用限额约束。全局总数不对应统一并发配额。</p>
 
+        <p class="runtime-freshness muted" role="status">
+          最后成功刷新：{{ runtimeLastSuccess ? runtimeLastSuccess.toLocaleString() : '尚无成功快照' }}
+          <span v-if="runtimeLoading"> · 刷新中…</span>
+          <span v-else-if="!runtimeAutoRefresh"> · 自动刷新已暂停</span>
+        </p>
+        <p v-if="runtimeError" class="runtime-error" role="alert">
+          刷新失败：{{ runtimeError }}。{{ runtime ? '以下保留最后成功快照，并非最新状态。' : '可点击刷新重试。' }}
+        </p>
         <div v-if="runtimeLoading && !runtime" class="muted">加载中…</div>
         <template v-else-if="runtime">
           <!-- 顶部：全局大数字 + 正在使用的用户 -->
           <div class="rt-hero">
             <div class="rt-hero-main">
-              <div class="rt-hero-label">全局处理中</div>
+              <div class="rt-hero-label">当前进程处理中</div>
               <div class="rt-hero-num">
                 <strong>{{ runtime.global.current }}</strong>
-                <span class="rt-hero-max">/ {{ runtime.global.limit || '∞' }}</span>
               </div>
               <div class="rt-hero-tag" :class="{ on: runtime.global.enabled }">
                 {{ runtime.global.enabled ? '限流已开启' : '未开启限流' }}
@@ -122,7 +129,7 @@
           <!-- 正在使用的用户（突出展示） -->
           <div class="rt-block" v-if="activeUsers.length">
             <div class="rt-block-title">
-              <h5>正在使用的用户</h5>
+              <h3>正在使用的用户</h3>
               <span class="muted">当前并发中的请求</span>
             </div>
             <div class="rt-chips">
@@ -133,24 +140,26 @@
                 <span class="rt-chip-limit">/ {{ u.limit || '∞' }}</span>
               </div>
             </div>
-            <div v-if="!activeUsers.length" class="rt-empty">当前没有进行中的请求</div>
           </div>
+
+          <div v-if="!activeUsers.length" class="rt-empty">当前没有正在使用的用户</div>
 
           <!-- 活跃模型 -->
           <div class="rt-block" v-if="activeModels.length">
             <div class="rt-block-title">
-              <h5>活跃模型</h5>
+              <h3>活跃模型</h3>
               <span class="muted">按当前处理数排序</span>
             </div>
             <div class="rt-models">
               <div v-for="m in activeModels" :key="m.slug" class="rt-model">
                 <span class="rt-model-name mono">{{ m.slug }}</span>
-                <div class="rt-model-track">
+                <div v-if="m.limit > 0" class="rt-model-track" :title="`${m.current} / ${m.limit}`">
                   <div
                     class="rt-model-bar"
                     :style="{ width: modelPct(m) }"
                   />
                 </div>
+                <span v-else class="muted small">该层不限额</span>
                 <span class="rt-model-num">{{ m.current }} <span class="muted">/ {{ m.limit || '∞' }}</span></span>
               </div>
             </div>
@@ -159,28 +168,31 @@
           <!-- 端点 + 正在使用的用户表格 -->
           <div class="runtime-grid">
             <div class="runtime-col">
-              <h5>按端点</h5>
+              <h3>活跃端点</h3>
               <table class="table mini">
                 <thead><tr><th>端点</th><th>当前</th></tr></thead>
                 <tbody>
-                  <tr v-for="e in runtime.endpoints" :key="e.name">
+                  <tr v-for="e in activeEndpoints" :key="e.name">
                     <td class="mono">{{ e.name }}</td>
                     <td><span class="dot-ind" :class="{ on: e.current > 0 }" />{{ e.current }}</td>
                   </tr>
-                  <tr v-if="!runtime.endpoints.length"><td colspan="2" class="muted">无进行中的请求</td></tr>
+                  <tr v-if="!activeEndpoints.length"><td colspan="2" class="muted">无进行中的请求</td></tr>
                 </tbody>
               </table>
             </div>
             <div class="runtime-col">
-              <h5>正在使用的用户（含空闲）</h5>
+              <div class="runtime-col-heading">
+                <h3>用户并发总表</h3>
+                <label class="runtime-idle-toggle"><input v-model="showIdleUsers" type="checkbox" /> 显示空闲</label>
+              </div>
               <table class="table mini">
                 <thead><tr><th>用户</th><th>当前 / 上限</th></tr></thead>
                 <tbody>
-                  <tr v-for="u in runtime.users" :key="u.id" :class="u.current === 0 ? 'row-dim' : ''">
+                  <tr v-for="u in visibleUsers" :key="u.id" :class="u.current === 0 ? 'row-dim' : ''">
                     <td class="mono">{{ u.name }}</td>
                     <td>{{ u.current }} / {{ u.limit || '∞' }}</td>
                   </tr>
-                  <tr v-if="!runtime.users.length"><td colspan="2" class="muted">无</td></tr>
+                  <tr v-if="!visibleUsers.length"><td colspan="2" class="muted">无</td></tr>
                 </tbody>
               </table>
             </div>
@@ -257,7 +269,7 @@
         <!-- 下钻明细 -->
         <div v-if="ruDetail.show" class="ru-detail">
           <div class="row-between">
-            <h4>「{{ ruDetail.name }}」调用明细</h4>
+            <h2>「{{ ruDetail.name }}」调用明细</h2>
             <button class="btn btn-ghost" type="button" @click="ruDetail.show = false">关闭</button>
           </div>
 
@@ -433,7 +445,7 @@
 
       <div v-if="testing && !editing" class="form test-panel">
         <div class="row-between">
-          <h4>连通性测试 · {{ testing.displayName || testing.slug }}</h4>
+          <h2>连通性测试 · {{ testing.displayName || testing.slug }}</h2>
           <button class="btn btn-ghost" type="button" @click="closeTest">关闭</button>
         </div>
         <p class="hint">
@@ -545,7 +557,7 @@
       </div>
 
       <form v-if="editing" class="form" @submit.prevent="saveModel">
-        <h4>{{ editing.id ? '编辑模型' : '注册模型' }}</h4>
+        <h2>{{ editing.id ? '编辑模型' : '注册模型' }}</h2>
 
         <div class="preview-card" :style="{ borderTopColor: editing.cardColor || '#3370ff' }">
           <div class="preview-top">
@@ -839,7 +851,7 @@
         </div>
 
         <div class="test-inline">
-          <h4>测试 API 可用性</h4>
+          <h2>测试 API 可用性</h2>
           <p class="hint">
             用上方 Base URL / 模型名 / Key 直连上游
             <code>{{ probePath(editing) }}</code>
@@ -1038,8 +1050,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { api } from '../api'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { api, type RuntimeStatus } from '../api'
 
 const tabs = [
   { id: 'stats', label: '总览' },
@@ -1073,31 +1085,73 @@ const docUrl = ref('https://ssemarket.cn/iwiki/space/space-R0M8mXw2')
 const rateLimits = ref<{ enabled: boolean; defaultRpm: number; defaultMaxConcurrent: number } | null>(
   null,
 )
-const runtime = ref<any>(null)
+const runtime = ref<RuntimeStatus | null>(null)
 const runtimeLoading = ref(false)
 const runtimeAutoRefresh = ref(true)
+const showIdleUsers = ref(false)
+const runtimeError = ref('')
+const runtimeLastSuccess = ref<Date | null>(null)
 let runtimeTimer: ReturnType<typeof setInterval> | null = null
+let runtimeRequest = 0
+let runtimeAbort: AbortController | null = null
+let runtimeMounted = false
+
+function runtimeVisible() {
+  return runtimeMounted && tab.value === 'limits' && !document.hidden
+}
+
+function cancelRuntimeRequest() {
+  ++runtimeRequest
+  runtimeAbort?.abort()
+  runtimeAbort = null
+  runtimeLoading.value = false
+}
+
+function syncRuntimePolling() {
+  stopRuntimePolling()
+  if (!runtimeVisible() || !runtimeAutoRefresh.value) return
+  void loadRuntimeStatus()
+  runtimeTimer = setInterval(() => {
+    if (runtimeVisible()) void loadRuntimeStatus()
+  }, 2000)
+}
 
 function onRuntimeAutoRefresh() {
-  if (runtimeAutoRefresh.value) {
-    loadRuntimeStatus()
-  }
+  cancelRuntimeRequest()
+  syncRuntimePolling()
+}
+
+function onRuntimeVisibilityChange() {
+  cancelRuntimeRequest()
+  syncRuntimePolling()
 }
 
 async function loadRuntimeStatus() {
-  if (runtimeLoading.value) return
+  if (!runtimeVisible() || runtimeLoading.value) return
+  const requestId = ++runtimeRequest
+  const controller = new AbortController()
+  runtimeAbort = controller
   runtimeLoading.value = true
   try {
-    runtime.value = await api.adminRateLimitsStatus()
+    const snapshot = await api.adminRateLimitsStatus(controller.signal)
+    if (requestId !== runtimeRequest || controller.signal.aborted) return
+    runtime.value = snapshot
+    runtimeLastSuccess.value = new Date()
+    runtimeError.value = ''
   } catch (e) {
-    runtime.value = null
+    if (requestId !== runtimeRequest || controller.signal.aborted) return
+    runtimeError.value = e instanceof Error ? e.message : '请求失败'
   } finally {
-    runtimeLoading.value = false
+    if (requestId === runtimeRequest) {
+      runtimeLoading.value = false
+      runtimeAbort = null
+    }
   }
 }
 
 // —— 实时并发：计算属性 ——
-const activeUsers = computed(() => runtime.value?.activeUsers || [])
+const activeUsers = computed(() => (runtime.value?.activeUsers || []).filter((u) => u.current > 0))
+const visibleUsers = computed(() => (runtime.value?.users || []).filter((u) => showIdleUsers.value || u.current > 0))
 const activeModels = computed(() =>
   (runtime.value?.models || []).filter((m: any) => m.current > 0).sort((a: any, b: any) => b.current - a.current),
 )
@@ -1107,8 +1161,8 @@ const activeEndpoints = computed(() =>
 function modelPct(m: any): string {
   const limit = Number(m.limit) || 0
   const cur = Number(m.current) || 0
-  if (limit <= 0) return Math.min(100, Math.max(8, cur * 10)) + '%'
-  return Math.min(100, Math.max(8, (cur / Math.max(1, limit)) * 100)) + '%'
+  if (limit <= 0) return '0%'
+  return Math.min(100, Math.max(0, (cur / limit) * 100)) + '%'
 }
 
 // —— 用户用量面板 ——
@@ -1345,16 +1399,12 @@ function stopRuntimePolling() {
 }
 
 watch(tab, (t) => {
+  cancelRuntimeRequest()
+  syncRuntimePolling()
   if (t === 'stats') loadStats()
   if (t === 'limits') {
     loadRateLimits()
     loadRuntimeStatus()
-    stopRuntimePolling()
-    runtimeTimer = setInterval(() => {
-      if (runtimeAutoRefresh.value) loadRuntimeStatus()
-    }, 2000)
-  } else {
-    stopRuntimePolling()
   }
   if (t === 'usage') loadUsageByUser()
   if (t === 'models') loadModels()
@@ -1657,6 +1707,8 @@ async function editLimits(u: any) {
 async function saveRateLimits() {
   if (!rateLimits.value) return
   await api.adminSaveRateLimits(rateLimits.value)
+  cancelRuntimeRequest()
+  await loadRuntimeStatus()
   alert('全局限流已保存')
 }
 
@@ -1670,7 +1722,18 @@ async function saveDocs() {
   alert('已保存')
 }
 
-onMounted(loadStats)
+onMounted(() => {
+  runtimeMounted = true
+  document.addEventListener('visibilitychange', onRuntimeVisibilityChange)
+  syncRuntimePolling()
+  void loadStats()
+})
+onUnmounted(() => {
+  runtimeMounted = false
+  stopRuntimePolling()
+  cancelRuntimeRequest()
+  document.removeEventListener('visibilitychange', onRuntimeVisibilityChange)
+})
 </script>
 
 <style scoped>
@@ -1741,6 +1804,18 @@ onMounted(loadStats)
   padding-top: var(--sp-4);
   border-top: 1px solid var(--line);
 }
+.runtime-freshness {
+  font-size: var(--fs-sm);
+  margin: 8px 0;
+}
+.runtime-error {
+  color: var(--danger-ink);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+.runtime-panel > .row-between {
+  flex-wrap: wrap;
+}
 .runtime-controls {
   display: flex;
   align-items: center;
@@ -1766,8 +1841,9 @@ onMounted(loadStats)
 .rt-hero-main {
   flex: 1.6;
   position: relative;
-  background: linear-gradient(135deg, #3370ff 0%, #5b8cff 55%, #7c5cd6 100%);
-  color: #fff;
+  background: var(--n-25);
+  border: 1px solid var(--line);
+  color: var(--ink-strong);
   border-radius: var(--radius);
   padding: var(--sp-5);
   display: flex;
@@ -1775,17 +1851,6 @@ onMounted(loadStats)
   justify-content: center;
   gap: 4px;
   overflow: hidden;
-  box-shadow: 0 8px 24px -6px rgba(51, 112, 255, 0.4);
-}
-.rt-hero-main::after {
-  content: '';
-  position: absolute;
-  right: -40px;
-  top: -60px;
-  width: 180px;
-  height: 180px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
 }
 .rt-hero-label {
   font-size: var(--fs-base);
@@ -1799,9 +1864,8 @@ onMounted(loadStats)
   position: relative;
 }
 .rt-hero-num strong {
-  font-size: 48px;
+  font-size: var(--fs-2xl);
   line-height: 1;
-  letter-spacing: -0.035em;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
@@ -1846,7 +1910,6 @@ onMounted(loadStats)
 .rt-hero-item-num {
   font-size: var(--fs-2xl);
   font-weight: 700;
-  letter-spacing: -0.03em;
   color: var(--brand-ink);
   font-variant-numeric: tabular-nums;
 }
@@ -1859,7 +1922,7 @@ onMounted(loadStats)
   gap: 8px;
   margin-bottom: var(--sp-3);
 }
-.rt-block-title h5 {
+.rt-block-title h3 {
   margin: 0;
   font-size: var(--fs-md);
   font-weight: 650;
@@ -1946,7 +2009,7 @@ onMounted(loadStats)
 .rt-model-bar {
   height: 100%;
   border-radius: var(--radius-pill);
-  background: linear-gradient(90deg, #5b8cff, var(--brand));
+  background: var(--brand);
   transition: width 0.35s var(--ease);
 }
 .rt-model-num {
@@ -1976,7 +2039,18 @@ onMounted(loadStats)
   gap: var(--sp-4);
   margin-bottom: var(--sp-4);
 }
-.runtime-col h5 {
+.runtime-col-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.runtime-idle-toggle {
+  font-size: var(--fs-sm);
+  color: var(--ink-soft);
+}
+.runtime-col h3 {
   margin: 0 0 var(--sp-2);
   font-size: var(--fs-base);
   font-weight: 650;

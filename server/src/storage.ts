@@ -10,6 +10,7 @@ import { config } from './config.js'
 
 /** 桶内对象键；与平台「同步历史数据」目录结构一致 */
 export const STORE_OBJECT_KEY = 'data/sseapi-store.json'
+export const HISTORY_OBJECT_KEYS = { usage_logs: 'data/history/usage_logs.jsonl', ledger: 'data/history/ledger.jsonl' } as const
 
 const localPath = () => path.join(config.dataDir, 'sseapi-store.json')
 
@@ -103,6 +104,32 @@ async function writeMinio(content: string): Promise<void> {
     }),
   )
 }
+
+export function localHistoryPath(table: keyof typeof HISTORY_OBJECT_KEYS): string { return path.join(config.dataDir, `${table}.jsonl`) }
+function uniqueHistory(rows: any[]): any[] {
+  return [...new Map(rows.map((row) => [row.id, row])).values()].sort((a, b) => a.id - b.id)
+}
+export async function appendHistory(table: keyof typeof HISTORY_OBJECT_KEYS, rows: unknown[]): Promise<void> {
+  if (!rows.length) return
+  const merged = uniqueHistory([...(await readHistory(table)), ...rows])
+  const content = merged.map((row) => JSON.stringify(row)).join('\n') + '\n'
+  fs.mkdirSync(config.dataDir, { recursive: true })
+  const p = localHistoryPath(table); const tmp = p + '.' + process.pid + '.tmp'
+  fs.writeFileSync(tmp, content); fs.renameSync(tmp, p)
+  if (isMinioConfigured()) await writeMinioHistory(table, content)
+}
+export async function readHistory(table: keyof typeof HISTORY_OBJECT_KEYS): Promise<any[]> {
+  const p = localHistoryPath(table)
+  const parse = (text: string): any[] => text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  const local = fs.existsSync(p) ? parse(fs.readFileSync(p, 'utf8')) : []
+  let remote: any[] = []
+  if (isMinioConfigured()) {
+    try { const result = await getS3().send(new GetObjectCommand({ Bucket: bucket(), Key: HISTORY_OBJECT_KEYS[table] })); if (result.Body) remote = parse(await result.Body.transformToString('utf8')) }
+    catch (error: any) { if (error?.name !== 'NoSuchKey' && error?.$metadata?.httpStatusCode !== 404) throw error }
+  }
+  return uniqueHistory([...remote, ...local])
+}
+async function writeMinioHistory(table: keyof typeof HISTORY_OBJECT_KEYS, content: string): Promise<void> { await getS3().send(new PutObjectCommand({Bucket: bucket(), Key: HISTORY_OBJECT_KEYS[table], Body: content, ContentType: 'application/x-ndjson'})) }
 
 /** 启动时加载：MinIO 为主；本地 PVC 为备份/冷启动种子 */
 export async function loadStoreRaw(): Promise<string | null> {

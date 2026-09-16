@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { loadStoreRaw, saveStoreRaw } from './storage.js'
+import { appendHistory, loadStoreRaw, readHistory, saveStoreRaw } from './storage.js'
 
 export type RateLimitsConfig = {
   enabled: number
@@ -351,27 +351,21 @@ function seedModels(s: Store) {
 
 let store: Store = emptyStore()
 let ready = false
+let persistQueue: Promise<void> = Promise.resolve()
 
-/** 裁剪 usage_logs 和 ledger，保留最近 N 条，防止 store 无限增长导致 OOM */
-function pruneStoreArrays() {
-  const MAX_USAGE_LOGS = 5000
-  const MAX_LEDGER = 10000
-  if (store.usage_logs.length > MAX_USAGE_LOGS) {
-    store.usage_logs.splice(0, store.usage_logs.length - MAX_USAGE_LOGS)
-  }
-  if (store.ledger.length > MAX_LEDGER) {
-    store.ledger.splice(0, store.ledger.length - MAX_LEDGER)
-  }
+function dedupeRows<T extends { id: number }>(rows: T[]): T[] {
+  const byId = new Map<number, T>()
+  for (const row of rows) byId.set(row.id, row)
+  return [...byId.values()]
 }
 
 export async function initDb() {
   const raw = await loadStoreRaw()
   store = parseStore(raw)
-  // 裁剪过大的 usage_logs 和 ledger，防止 OOM
-  pruneStoreArrays()
-  // 新库、或 migrate 修复了脏 id 等字段时落盘
-  await save(store)
+  store.usage_logs = dedupeRows(store.usage_logs).sort((a, b) => a.id - b.id)
+  store.ledger = dedupeRows(store.ledger).sort((a, b) => a.id - b.id)
   ready = true
+  try { await persist() } catch (error) { ready = false; throw error }
 }
 
 export function assertDbReady() {
@@ -398,9 +392,23 @@ function nextId(table: keyof Store['seq']) {
   return store.seq[table]
 }
 
-async function persist() {
+async function persistInternal() {
   assertDbReady()
+  const u = store.usage_logs.slice(0, Math.max(0, store.usage_logs.length - 5000))
+  const l = store.ledger.slice(0, Math.max(0, store.ledger.length - 10000))
+  await appendHistory('usage_logs', u)
+  await appendHistory('ledger', l)
+  const usageIds = new Set(u.map((row) => row.id))
+  const ledgerIds = new Set(l.map((row) => row.id))
+  store.usage_logs = store.usage_logs.filter((row) => !usageIds.has(row.id))
+  store.ledger = store.ledger.filter((row) => !ledgerIds.has(row.id))
   await save(store)
+}
+
+async function persist() {
+  const run = persistQueue.then(() => persistInternal())
+  persistQueue = run.catch(() => undefined)
+  return run
 }
 
 export const db = {
@@ -409,22 +417,36 @@ export const db = {
     return store
   },
   persist,
+  async readUsageLogs(): Promise<Store["usage_logs"]> {
+    assertDbReady()
+    await persistQueue
+    const archived = await readHistory("usage_logs")
+    return dedupeRows([...archived, ...store.usage_logs]).sort((a, b) => a.id - b.id)
+  },
+  async readLedger(): Promise<Store["ledger"]> {
+    assertDbReady()
+    await persistQueue
+    const archived = await readHistory("ledger")
+    return dedupeRows([...archived, ...store.ledger]).sort((a, b) => a.id - b.id)
+  },
   reload: async () => {
-    const raw = await loadStoreRaw()
-    store = parseStore(raw)
-    pruneStoreArrays()
+    await initDb()
   },
   nextId,
   async transaction<T>(fn: () => T): Promise<T> {
-    const snap = JSON.parse(JSON.stringify(store)) as Store
-    try {
-      const r = fn()
-      await persist()
-      return r
-    } catch (e) {
-      store = snap
-      throw e
-    }
+    const run = persistQueue.then(async () => {
+      const snap = JSON.parse(JSON.stringify(store)) as Store
+      try {
+        const r = fn()
+        await persistInternal()
+        return r
+      } catch (e) {
+        store = snap
+        throw e
+      }
+    })
+    persistQueue = run.then(() => undefined, () => undefined)
+    return run
   },
 }
 

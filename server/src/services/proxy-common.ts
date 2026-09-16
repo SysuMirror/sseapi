@@ -255,12 +255,6 @@ export async function appendUsage(
     prompt: prompt || promptPreview(req),
     created_at: now(),
   })
-  // 自动裁剪：保留最近 5000 条，防止 store 无限增长导致 OOM
-  const MAX_USAGE_LOGS = 5000
-  const logs = db.getStore().usage_logs
-  if (logs.length > MAX_USAGE_LOGS) {
-    logs.splice(0, logs.length - MAX_USAGE_LOGS)
-  }
   await db.persist()
 }
 

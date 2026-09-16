@@ -34,13 +34,13 @@ function assert(cond, msg) {
   if (!cond) { failed = true; console.log('FAIL:', msg) } else { console.log('  ok -', msg) }
 }
 
-// mock 上游：chat-slow 延迟 800ms，普通 0ms
+// mock 上游：conc-slow 延迟 800ms，普通 0ms
 const mock = http.createServer((req, res) => {
   let raw = ''
   req.on('data', (c) => (raw += c))
   req.on('end', () => {
     const body = raw ? JSON.parse(raw) : {}
-    const delay = body.model === 'chat-slow' ? 800 : 0
+    const delay = body.model === 'conc-slow' ? 800 : 0
     setTimeout(() => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
@@ -80,9 +80,9 @@ const store = {
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sseapi-rl-'))
 fs.writeFileSync(path.join(dataDir, 'sseapi-store.json'), JSON.stringify(store, null, 2))
 
-const child = spawn(process.execPath, ['dist/index.js'], {
-  cwd: serverDir,
-  env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, JWT_SECRET, SSEAPI_API_PUBLIC_URL: BASE, PLATFORM_ADMIN_OAUTH_IDS: ADMIN_OAUTH },
+const child = spawn(process.execPath, [path.join(process.env.SSEAPI_TEST_BUILD_DIR || path.join(serverDir, 'dist'), 'index.js')], {
+  cwd: dataDir,
+  env: { PATH: process.env.PATH, PORT: String(PORT), DATA_DIR: dataDir, JWT_SECRET, SSEAPI_API_PUBLIC_URL: BASE, PLATFORM_ADMIN_OAUTH_IDS: ADMIN_OAUTH },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
 let outLog = ''

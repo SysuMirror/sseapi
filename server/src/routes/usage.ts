@@ -8,8 +8,11 @@ import { checkDeveloper, userReqs, isDevPlatformConfigured } from '../services/d
 export const usageRouter = Router()
 usageRouter.use(authJwt)
 
-/** 默认聚合的模型上限（超出则截断，避免返回过大） */
-const AGG_MAX_GROUPS = 200
+function matchesStatus(status: string, filters: string[]): boolean {
+  return filters.length === 0 || filters.some((wanted) =>
+    wanted === 'error' ? status !== 'ok' : status === wanted,
+  )
+}
 
 function sinceDays(days: number) {
   return Date.now() - days * 24 * 60 * 60 * 1000
@@ -88,7 +91,7 @@ const VALID_GRANULARITIES = new Set(['day', 'hour', 'request'])
  *  - from / to : ISO 时间，精确时间范围
  *  - page / page_size: request 颗粒度下分页
  */
-usageRouter.get('/aggregate', (req: AuthedRequest, res) => {
+usageRouter.get('/aggregate', async (req: AuthedRequest, res) => {
   const userId = req.user!.id
   const isAdmin = !!req.user!.is_admin
   const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
@@ -109,9 +112,7 @@ usageRouter.get('/aggregate', (req: AuthedRequest, res) => {
     modelTypeBySlug.set(m.slug, modelTypeOf(m))
   }
 
-  let logs = db
-    .getStore()
-    .usage_logs.filter((l) => {
+  let logs = (await db.readUsageLogs()).filter((l) => {
       if (l.user_id !== targetUserId) return false
       const t = new Date(l.created_at).getTime()
       if (t < from || t > to) return false
@@ -120,15 +121,7 @@ usageRouter.get('/aggregate', (req: AuthedRequest, res) => {
         const mt = modelTypeBySlug.get(l.model_slug) || ''
         if (!typeFilter.includes(mt)) return false
       }
-      if (statusFilter.length) {
-        const isErr = l.status && l.status !== 'ok'
-        const wantErr = statusFilter.includes('error')
-        if (wantErr) {
-          if (!isErr) return false
-        } else if (!statusFilter.includes(l.status)) {
-          return false
-        }
-      }
+      if (!matchesStatus(l.status, statusFilter)) return false
       if (apiKeyIdFilter != null && l.api_key_id !== apiKeyIdFilter) return false
       return true
     })
@@ -214,7 +207,6 @@ usageRouter.get('/aggregate', (req: AuthedRequest, res) => {
   let byModel = [...modelMap.values()]
     .sort((a, b) => b.cost_cents - a.cost_cents)
     .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
-  if (byModel.length > AGG_MAX_GROUPS) byModel = byModel.slice(0, AGG_MAX_GROUPS)
 
   // —— 按状态分组 ——
   const statusMap = new Map<string, { status: string; request_count: number; tokens: number; cost_cents: number }>()
@@ -297,18 +289,11 @@ usageRouter.get('/by-user', async (req: AuthedRequest, res) => {
     return u ? u.oauth_id || '' : ''
   }
 
-  let logs = s.usage_logs.filter((l) => {
+  let logs = (await db.readUsageLogs()).filter((l) => {
     const t = new Date(l.created_at).getTime()
     if (t < from || t > to) return false
     if (modelFilter.length && !modelFilter.includes(l.model_slug)) return false
-    if (statusFilter.length) {
-      const isErr = l.status && l.status !== 'ok'
-      if (statusFilter.includes('error')) {
-        if (!isErr) return false
-      } else if (!statusFilter.includes(l.status)) {
-        return false
-      }
-    }
+    if (!matchesStatus(l.status, statusFilter)) return false
     if (typeFilter.length) {
       const mt = modelTypeBySlug.get(l.model_slug) || ''
       if (!typeFilter.includes(mt)) return false
@@ -414,13 +399,13 @@ usageRouter.get('/by-user', async (req: AuthedRequest, res) => {
 })
 
 /** 透出 /logs 增加筛选：按状态/model/时间过滤，并透出完整字段（含 error 明细/prompt） */
-usageRouter.get('/logs', (req: AuthedRequest, res) => {
+usageRouter.get('/logs', async (req: AuthedRequest, res) => {
   const page = Math.max(1, Number(req.query.page) || 1)
   const pageSize = Math.min(200, Math.max(1, Number(req.query.page_size) || 20))
   const isAdmin = !!req.user!.is_admin
   // 管理员可看指定 userId 的日志；普通用户只能看自己
   const userId = isAdmin && req.query.userId ? Number(req.query.userId) : req.user!.id
-  const days = Math.min(90, Math.max(1, Number(req.query.days) || 0))
+  const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
   const modelFilter = splitCsv(req.query.model)
   const statusFilter = splitCsv(req.query.status)
   const typeFilter = splitCsv(req.query.type || req.query.modelType)
@@ -431,9 +416,7 @@ usageRouter.get('/logs', (req: AuthedRequest, res) => {
     modelTypeBySlug.set(m.slug, modelTypeOf(m))
   }
 
-  let all = db
-    .getStore()
-    .usage_logs.filter((l) => {
+  let all = (await db.readUsageLogs()).filter((l) => {
       if (l.user_id !== userId) return false
       if (from && new Date(l.created_at).getTime() < from) return false
       if (modelFilter.length && !modelFilter.includes(l.model_slug)) return false
@@ -441,14 +424,7 @@ usageRouter.get('/logs', (req: AuthedRequest, res) => {
         const mt = modelTypeBySlug.get(l.model_slug) || ''
         if (!typeFilter.includes(mt)) return false
       }
-      if (statusFilter.length) {
-        const isErr = l.status && l.status !== 'ok'
-        if (statusFilter.includes('error')) {
-          if (!isErr) return false
-        } else if (!statusFilter.includes(l.status)) {
-          return false
-        }
-      }
+      if (!matchesStatus(l.status, statusFilter)) return false
       return true
     })
     .sort((a, b) => b.id - a.id)
@@ -503,13 +479,11 @@ usageRouter.get('/by-user/:userId/reqs', requireAdmin, async (req: AuthedRequest
   }
 })
 
-usageRouter.get('/summary', (req: AuthedRequest, res) => {
+usageRouter.get('/summary', async (req: AuthedRequest, res) => {
   const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
   const userId = req.user!.id
   const from = sinceDays(days)
-  const logs = db
-    .getStore()
-    .usage_logs.filter((l) => l.user_id === userId && new Date(l.created_at).getTime() >= from)
+  const logs = (await db.readUsageLogs()).filter((l) => l.user_id === userId && new Date(l.created_at).getTime() >= from)
 
   const totals = logs.reduce(
     (a, l) => {

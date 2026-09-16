@@ -10,11 +10,9 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10) // YYYY-MM-DD
 }
 
-function hasCheckedInToday(userId: number): boolean {
+async function hasCheckedInToday(userId: number): Promise<boolean> {
   const today = todayStr()
-  return db
-    .getStore()
-    .ledger.some(
+  return (await db.readLedger()).some(
       (l) => l.user_id === userId && l.kind === 'checkin' && l.created_at.startsWith(today),
     )
 }
@@ -22,13 +20,13 @@ function hasCheckedInToday(userId: number): boolean {
 export const billingRouter = Router()
 billingRouter.use(authJwt)
 
-billingRouter.get('/summary', (req: AuthedRequest, res) => {
+billingRouter.get('/summary', async (req: AuthedRequest, res) => {
   const userId = req.user!.id
-  const ledger = db.getStore().ledger.filter((l) => l.user_id === userId)
-  const usageLogs = db.getStore().usage_logs.filter((l) => l.user_id === userId && l.status === 'ok')
+  const ledger = (await db.readLedger()).filter((l) => l.user_id === userId)
+  const usageLogs = (await db.readUsageLogs()).filter((l) => l.user_id === userId && l.status === 'ok')
 
   const totalCredited = ledger
-    .filter((l) => l.kind === 'credit' && l.amount_cents > 0)
+    .filter((l) => ['credit', 'checkin'].includes(l.kind) && l.amount_cents > 0)
     .reduce((a, l) => a + l.amount_cents, 0)
   const totalSpent = usageLogs.reduce((a, l) => a + l.cost_cents, 0)
   const totalRequests = usageLogs.length
@@ -54,46 +52,47 @@ billingRouter.get('/balance', (req: AuthedRequest, res) => {
 })
 
 /** 查询今日签到状态 */
-billingRouter.get('/checkin', (req: AuthedRequest, res) => {
+billingRouter.get('/checkin', async (req: AuthedRequest, res) => {
   ok(res, {
-    checkedIn: hasCheckedInToday(req.user!.id),
+    checkedIn: await hasCheckedInToday(req.user!.id),
     rewardYuan: CHECKIN_REWARD_CENTS / 100,
   })
 })
+
+// A single queue protects the read/check/write sequence, including archive reads.
+// The JSON store is single-process; cross-process writers require a database lock.
+let checkinQueue: Promise<void> = Promise.resolve()
 
 /** 每日签到：每天一次，奖励 10 元余额 */
-billingRouter.post('/checkin', async (req: AuthedRequest, res) => {
+billingRouter.post('/checkin', async (req: AuthedRequest, res, next) => {
   const userId = req.user!.id
-  if (hasCheckedInToday(userId)) {
+  const task = checkinQueue.then(async () => {
+    if (await hasCheckedInToday(userId)) {
+      ok(res, {
+        checkedIn: true,
+        already: true,
+        rewardYuan: CHECKIN_REWARD_CENTS / 100,
+        message: '今日已签到',
+      })
+      return
+    }
+    const user = await creditUser(userId, CHECKIN_REWARD_CENTS, 'checkin', '每日签到奖励')
     ok(res, {
       checkedIn: true,
-      already: true,
+      already: false,
       rewardYuan: CHECKIN_REWARD_CENTS / 100,
-      message: '今日已签到',
+      balanceCents: user.balance_cents,
+      balanceYuan: centsToYuan(user.balance_cents),
     })
-    return
-  }
-  const user = await creditUser(
-    userId,
-    CHECKIN_REWARD_CENTS,
-    'checkin',
-    '每日签到奖励',
-  )
-  ok(res, {
-    checkedIn: true,
-    already: false,
-    rewardYuan: CHECKIN_REWARD_CENTS / 100,
-    balanceCents: user.balance_cents,
-    balanceYuan: centsToYuan(user.balance_cents),
   })
+  checkinQueue = task.then(() => undefined, () => undefined)
+  try { await task } catch (error) { next(error) }
 })
 
-billingRouter.get('/ledger', (req: AuthedRequest, res) => {
+billingRouter.get('/ledger', async (req: AuthedRequest, res) => {
   const page = Math.max(1, Number(req.query.page) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size) || 20))
-  const all = db
-    .getStore()
-    .ledger.filter((l) => l.user_id === req.user!.id)
+  const all = (await db.readLedger()).filter((l) => l.user_id === req.user!.id)
     .sort((a, b) => b.id - a.id)
   const total = all.length
   const items = all.slice((page - 1) * pageSize, page * pageSize).map((r) => ({

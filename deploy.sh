@@ -6,6 +6,14 @@ PORT="${PORT:-8080}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# ── 自愈:修复 node_modules 里可能残留的非 cloud 属主文件 ──
+# 之前若以 root 跑过 npm 会留 root 文件,cloud 跑 npm ci 时 EACCES 崩;cloud 属 sudo 组可提权修复
+if [ -d "$ROOT/server/node_modules" ] && \
+   find "$ROOT/server/node_modules" -maxdepth 3 ! -user cloud 2>/dev/null | head -1 | grep -q .; then
+  echo "[deploy] 自愈:检测到非 cloud 属主文件,sudo chown -R cloud:cloud server"
+  sudo chown -R cloud:cloud "$ROOT/server" 2>/dev/null || true
+fi
+
 DATA_DIR="${SDPY_DATA_DIR:-${DATA_DIR:-$ROOT/data}}"
 mkdir -p "$DATA_DIR"
 export DATA_DIR

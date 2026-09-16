@@ -35,27 +35,39 @@ const concurrentCounts = new Map<string, number>()
 const endpointActive = new Map<string, number>()
 const globalActive = new Map<string, number>() // key 固定为 'all'
 
-function ensureEndpointActive(name: string) {
-  if (!endpointActive.has(name)) endpointActive.set(name, 0)
-}
+const modelActive = new Map<string, number>()
+const userActive = new Map<string, number>()
+const keyActive = new Map<string, number>()
+let withoutModel = 0
 
-/** 标记某端点有一个请求进入；返回释放函数。endpointName 如 chat/completions */
-export function trackEndpoint(endpointName: string) {
-  const key = endpointName || 'unknown'
-  ensureEndpointActive(key)
-  endpointActive.set(key, (endpointActive.get(key) || 0) + 1)
-  globalActive.set('all', (globalActive.get('all') || 0) + 1)
+/** Observe admitted requests independently of configured limits. */
+export function trackEndpoint(endpointName: string, req: AuthedRequest, res: Response, modelSlug?: string) {
+  if (req.aborted || res.destroyed || res.writableEnded) return () => {}
+  const dimensions: Array<[Map<string, number>, string]> = [
+    [globalActive, 'all'],
+    [endpointActive, endpointName || 'unknown'],
+  ]
+  if (modelSlug) dimensions.push([modelActive, modelSlug])
+  else withoutModel++
+  if (req.user) dimensions.push([userActive, String(req.user.id)])
+  if (req.apiKeyId != null) dimensions.push([keyActive, String(req.apiKeyId)])
+  for (const [map, key] of dimensions) map.set(key, (map.get(key) || 0) + 1)
   let released = false
-  return () => {
+  const release = () => {
     if (released) return
     released = true
-    const curE = endpointActive.get(key) || 0
-    if (curE <= 1) endpointActive.delete(key)
-    else endpointActive.set(key, curE - 1)
-    const curG = globalActive.get('all') || 0
-    if (curG <= 1) globalActive.delete('all')
-    else globalActive.set('all', curG - 1)
+    res.off('close', release)
+    res.off('finish', release)
+    for (const [map, key] of dimensions) {
+      const current = map.get(key) || 0
+      if (current <= 1) map.delete(key)
+      else map.set(key, current - 1)
+    }
+    if (!modelSlug) withoutModel--
   }
+  res.once('close', release)
+  res.once('finish', release)
+  return release
 }
 
 /** 面板：当前各维度并发 */
@@ -64,19 +76,12 @@ export function getRuntimeStatus() {
   const cfg = getRateLimitsConfig()
   const activeByEndpoint: Record<string, number> = {}
   for (const [k, v] of endpointActive) activeByEndpoint[k] = v
-
   const modelMap: Record<string, { current: number; limit: number }> = {}
   const userMap: Record<string, { current: number; limit: number }> = {}
   const keyMap: Record<string, { current: number; limit: number }> = {}
-  for (const [k, v] of concurrentCounts) {
-    if (k.startsWith('conc:model:')) {
-      modelMap[k.slice('conc:model:'.length)] = { current: v, limit: 0 }
-    } else if (k.startsWith('conc:user:')) {
-      userMap[k.slice('conc:user:'.length)] = { current: v, limit: 0 }
-    } else if (k.startsWith('conc:key:')) {
-      keyMap[k.slice('conc:key:'.length)] = { current: v, limit: 0 }
-    }
-  }
+  for (const [k, v] of modelActive) modelMap[k] = { current: v, limit: 0 }
+  for (const [k, v] of userActive) userMap[k] = { current: v, limit: 0 }
+  for (const [k, v] of keyActive) keyMap[k] = { current: v, limit: 0 }
   // 上限来自各自行配置；已删除/未配置的补 0
   for (const m of s.models) {
     const id = String(m.slug)
@@ -94,19 +99,21 @@ export function getRuntimeStatus() {
     else keyMap[id].limit = normalizeLimit(k.max_concurrent)
   }
 
-  const userNameOf = (id: string) => {
-    const u = s.users.find((x) => String(x.id) === id)
-    return u ? u.name || `用户${id}` : `用户${id}`
-  }
+  const userNames = new Map(s.users.map((u) => [String(u.id), u.name || `用户${u.id}`]))
+  const userNameOf = (id: string) => userNames.get(id) || `用户${id}`
   const activeUsers = Object.entries(userMap)
     .map(([id, v]) => ({ id, name: userNameOf(id), current: v.current, limit: v.limit }))
     .filter((u) => u.current > 0)
     .sort((a, b) => b.current - a.current)
 
   return {
+    sampledAt: new Date().toISOString(),
+    scope: 'process' as const,
+    withoutModel,
     global: {
       current: globalActive.get('all') || 0,
-      limit: cfg.enabled === 1 ? 0 : 0,
+      // Defaults are fallback policy values, not a process-wide hard cap.
+      limit: 0,
       enabled: cfg.enabled === 1,
     },
     endpoints: Object.entries(activeByEndpoint)
