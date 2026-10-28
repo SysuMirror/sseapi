@@ -20,6 +20,11 @@ const router = createRouter({
       meta: { requiresAuth: true },
       children: [
         { path: '', name: 'overview', component: () => import('../views/OverviewView.vue') },
+        {
+          path: 'playground',
+          name: 'playground',
+          component: () => import('../views/PlaygroundView.vue'),
+        },
         { path: 'keys', name: 'keys', component: () => import('../views/KeysView.vue') },
         { path: 'usage', name: 'usage', component: () => import('../views/UsageView.vue') },
         { path: 'billing', name: 'billing', component: () => import('../views/BillingView.vue') },

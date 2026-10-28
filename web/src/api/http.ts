@@ -13,6 +13,11 @@ function resolveBase(): string {
   return raw.endsWith('/') ? raw : `${raw}/`
 }
 
+/** 给裸 fetch 用的 API 根地址（SSE 流式走 fetch，不走 axios 拦截器） */
+export function apiBaseUrl(): string {
+  return resolveBase()
+}
+
 const instance: AxiosInstance = axios.create({
   baseURL: resolveBase(),
   timeout: 60000,

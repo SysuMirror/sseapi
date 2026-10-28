@@ -33,6 +33,7 @@ import { docsRouter } from './routes/docs.js'
 import { adminRouter } from './routes/admin.js'
 
 import { proxyRouter } from './routes/proxy.js'
+import { playgroundRouter } from './routes/playground.js'
 
 
 
@@ -121,6 +122,8 @@ app.use('/api/models', modelsRouter)
 app.use('/api/docs', docsRouter)
 
 app.use('/api/admin', adminRouter)
+// 控制台 playground：登录态(JWT)流式对话
+app.use('/api/playground', playgroundRouter)
 
 app.use('/v1', proxyRouter)
 

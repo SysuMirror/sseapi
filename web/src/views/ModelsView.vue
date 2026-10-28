@@ -53,6 +53,14 @@
         </div>
 
         <div class="actions">
+          <button
+            v-if="(m.modelType || 'chat') === 'chat' && m.enabled"
+            class="btn btn-ghost"
+            type="button"
+            @click="tryModel(m.slug)"
+          >
+            试用
+          </button>
           <button class="btn btn-primary btn-doc" type="button" @click="openDocs">
             API 文档
           </button>
@@ -137,12 +145,18 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { openDocs } from '../store/docs'
 
 const models = ref<any[]>([])
 const expanded = reactive<Record<number, boolean>>({})
 const copied = ref(false)
+const router = useRouter()
+
+function tryModel(slug: string) {
+  router.push({ name: 'playground', query: { model: slug } })
+}
 
 function formatPrice(v: unknown) {
   const n = Number(v)
