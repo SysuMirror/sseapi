@@ -11,6 +11,8 @@ export interface PlaygroundChatBody {
 
 export interface StreamHandlers {
   onDelta: (text: string) => void
+  /** 思考过程增量（reasoning_content/reasoning），模型不返回时不会触发 */
+  onReasoning?: (text: string) => void
   onDone: () => void
   onError: (message: string, status: number, retryAfter?: string) => void
 }
@@ -108,6 +110,9 @@ function dispatch(block: string, handlers: StreamHandlers) {
     handlers.onError(String(j.error.message || j.error), 502)
     return
   }
-  const delta = j?.choices?.[0]?.delta?.content ?? j?.choices?.[0]?.message?.content
+  const d0 = j?.choices?.[0]?.delta
+  const reasoning = d0?.reasoning_content ?? d0?.reasoning
+  if (typeof reasoning === 'string' && reasoning && handlers.onReasoning) handlers.onReasoning(reasoning)
+  const delta = d0?.content ?? j?.choices?.[0]?.message?.content
   if (typeof delta === 'string' && delta) handlers.onDelta(delta)
 }

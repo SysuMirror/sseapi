@@ -41,6 +41,19 @@ function blocks(text: string): string {
       closeList()
       continue
     }
+    // 分隔线
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) {
+      closeList()
+      out.push('<hr>')
+      continue
+    }
+    // 引用块（连续 > 行各自成段落，视觉上贴在一起）
+    const bq = /^>\s?(.*)$/.exec(t)
+    if (bq) {
+      closeList()
+      out.push(`<blockquote>${inline(bq[1])}</blockquote>`)
+      continue
+    }
     const h = /^(#{1,6})\s+(.*)$/.exec(t)
     if (h) {
       closeList()
