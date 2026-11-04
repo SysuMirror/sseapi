@@ -86,7 +86,7 @@ function readTicket(json: RawResponse): SsoTicket | null {
   const maxAge = Number(json.sso_max_age)
   return {
     session,
-    cookieName: String(json.sso_cookie_name || 'sse_sso').trim(),
+    cookieName: String(json.sso_cookie_name || 'unisso_sid').trim(),
     cookieDomain: String(json.sso_cookie_domain || '.ssemarket.cn').trim(),
     maxAge: Number.isFinite(maxAge) && maxAge > 0 ? Math.floor(maxAge) : 604800,
   }

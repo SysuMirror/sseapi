@@ -13,7 +13,7 @@ import { authJwt, ok, fail, signUserToken, type AuthedRequest } from '../middlew
 
 export const authRouter = Router()
 
-const SSO_COOKIE = 'sse_sso'
+const SSO_COOKIES = ['unisso_sid', 'sse_sso'] // Cookie 改名期：新名在前
 const SSO_COOKIE_DOMAIN = '.ssemarket.cn'
 const SSO_MAX_AGE = 604800
 /** 静默登录限流：10 次/分钟/IP（客户端 IP 取自 nginx 传入的 X-Forwarded-For） */
@@ -41,11 +41,15 @@ function hitSsoRateLimit(ip: string): boolean {
 
 function readSsoCookie(req: { headers: Record<string, unknown> }): string {
   const raw = String(req.headers.cookie || '')
-  for (const part of raw.split(';')) {
-    const idx = part.indexOf('=')
-    if (idx < 0) continue
-    if (part.slice(0, idx).trim() === SSO_COOKIE) {
-      return decodeURIComponent(part.slice(idx + 1).trim())
+  // Cookie 改名期双读：先 unisso_sid，为空再读 sse_sso
+  for (const name of SSO_COOKIES) {
+    for (const part of raw.split(';')) {
+      const idx = part.indexOf('=')
+      if (idx < 0) continue
+      if (part.slice(0, idx).trim() === name) {
+        const value = decodeURIComponent(part.slice(idx + 1).trim())
+        if (value) return value
+      }
     }
   }
   return ''
@@ -59,10 +63,13 @@ function setSsoCookie(res: { append: (k: string, v: string) => void }, ticket: S
 }
 
 function clearSsoCookie(res: { append: (k: string, v: string) => void }) {
-  res.append(
-    'Set-Cookie',
-    `${SSO_COOKIE}=; Domain=${SSO_COOKIE_DOMAIN}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`,
-  )
+  // 改名期双清：新旧两个名字都按父域清除
+  for (const name of SSO_COOKIES) {
+    res.append(
+      'Set-Cookie',
+      `${name}=; Domain=${SSO_COOKIE_DOMAIN}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`,
+    )
+  }
 }
 
 function loginPayload(user: UserRow, profile: UniSSOProfile) {
