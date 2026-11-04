@@ -69,34 +69,62 @@ export function isDevPlatformConfigured(): boolean {
 
 // —— 开发者身份缓存（列表/调用需要频繁判定，接口调用有成本）——
 const devCache = new Map<string, { at: number; isDev: boolean }>()
+const devInflight = new Map<string, Promise<boolean>>()
 const DEV_CACHE_TTL = 120_000 // 2 分钟
 
-/** 判断某 oauthId 是否为集市开发者（带 2 分钟缓存；平台未配置或未知 → false，fail-closed） */
+/** 刷新单个用户的开发者身份（同一用户并发时只发一次请求） */
+function refreshDeveloper(oauthId: string): Promise<boolean> {
+  const running = devInflight.get(oauthId)
+  if (running) return running
+  const task = (async () => {
+    try {
+      const r = await checkDeveloper(oauthId)
+      const isDev = !!(r.found && r.isDeveloper)
+      devCache.set(oauthId, { at: Date.now(), isDev })
+      return isDev
+    } catch {
+      // 外部平台抖动时沿用上一次结论，避免把开发者误判成普通用户
+      return devCache.get(oauthId)?.isDev ?? false
+    } finally {
+      devInflight.delete(oauthId)
+    }
+  })()
+  devInflight.set(oauthId, task)
+  return task
+}
+
+/**
+ * 判断某 oauthId 是否为集市开发者（平台未配置或未知 → false，fail-closed）。
+ *
+ * 过期策略是 stale-while-revalidate：缓存过期后先返回上一次结论、后台刷新。
+ * 之前是同步刷新，TTL 一过，模型列表接口就要等一次外部 HTTP（最长 8s），
+ * 表现为「进模型卡界面偶尔要转很久」。
+ */
 export async function userIsDeveloper(oauthId?: string | null): Promise<boolean> {
   if (!isDevPlatformConfigured()) return false
   if (!oauthId) return false
   const hit = devCache.get(oauthId)
-  if (hit && Date.now() - hit.at < DEV_CACHE_TTL) return hit.isDev
-  let isDev = false
-  try {
-    const r = await checkDeveloper(oauthId)
-    isDev = !!(r.found && r.isDeveloper)
-  } catch {
-    isDev = false
+  if (hit) {
+    if (Date.now() - hit.at >= DEV_CACHE_TTL) void refreshDeveloper(oauthId)
+    return hit.isDev
   }
-  devCache.set(oauthId, { at: Date.now(), isDev })
-  return isDev
+  return refreshDeveloper(oauthId) // 首次未知，只能等这一次
+}
+
+/** 集市 userID：UniSSO 迁移后存 sse_user_id；旧数据/无绑定时退回 oauth_id */
+export function marketUserId(u: { sse_user_id?: string | null; oauth_id?: string | null }): string {
+  return String(u.sse_user_id || u.oauth_id || '').trim()
 }
 
 /**
  * 判断某用户是否可访问「仅开发者」模型：
  * 管理员恒可；否则需为集市开发者。平台未配置时普通用户一律不可（fail-closed）。
  */
-export async function mayAccessDevOnly(req: { user?: { oauth_id?: string | null; is_admin?: number | null } }): Promise<boolean> {
+export async function mayAccessDevOnly(req: { user?: { sse_user_id?: string | null; oauth_id?: string | null; is_admin?: number | null } }): Promise<boolean> {
   const u = req.user
   if (!u) return false
   if (u.is_admin) return true
-  return userIsDeveloper(u.oauth_id)
+  return userIsDeveloper(marketUserId(u))
 }
 
 /**

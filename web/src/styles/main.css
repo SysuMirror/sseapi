@@ -111,6 +111,16 @@
   /* —— 动效 —— */
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
   --dur: 0.18s;
+
+  /* —— 装饰层（旋转环 / 网格 / 光晕 / 极光）—— */
+  --brand-rgb: 51, 112, 255;
+  --violet-rgb: 124, 92, 214;
+  --cyan-rgb: 34, 196, 220;
+  --decor-line: rgba(16, 24, 40, 0.075);
+  --decor-size: 56px;
+  --glow-brand: rgba(51, 112, 255, 0.3);
+  --glow-violet: rgba(124, 92, 214, 0.24);
+  --glow-cyan: rgba(34, 196, 220, 0.16);
 }
 
 /* ==========================================================================
@@ -316,12 +326,29 @@ button {
    ========================================================================== */
 
 .page-title {
+  display: flex;
+  align-items: center;
+  gap: 11px;
   margin: 0 0 6px;
   font-size: var(--fs-2xl);
   font-weight: 680;
   letter-spacing: -0.028em;
   line-height: 1.2;
   color: var(--ink-strong);
+}
+
+/* 标题前的呼吸光点：给每个页面一个统一的「在线」提示 */
+.page-title::before {
+  content: '';
+  flex-shrink: 0;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--brand);
+  box-shadow:
+    0 0 0 4px rgba(var(--brand-rgb), 0.13),
+    0 0 14px rgba(var(--brand-rgb), 0.55);
+  animation: glow-pulse 3.4s var(--ease) infinite;
 }
 
 .page-sub {
@@ -585,6 +612,142 @@ select {
   overflow-x: auto;
   margin: 0 -2px;
   padding: 0 2px;
+}
+
+/* ==========================================================================
+   装饰层
+   ========================================================================== */
+
+/* 网格底纹：四周用 mask 淡出，避免整屏都是格子显得闷 */
+.decor-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(var(--decor-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--decor-line) 1px, transparent 1px);
+  background-size: var(--decor-size) var(--decor-size);
+  -webkit-mask-image: radial-gradient(ellipse 92% 72% at 50% 0%, #000 12%, transparent 78%);
+  mask-image: radial-gradient(ellipse 92% 72% at 50% 0%, #000 12%, transparent 78%);
+}
+
+/* 顶部品牌光晕 */
+.decor-glow {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(880px 480px at 18% -10%, var(--glow-brand), transparent 62%),
+    radial-gradient(700px 420px at 88% 2%, var(--glow-violet), transparent 60%),
+    radial-gradient(620px 380px at 55% 108%, var(--glow-cyan), transparent 62%);
+}
+
+/* 缓慢游走的极光带：给静止的页面一点「活着」的感觉 */
+.decor-aurora {
+  position: absolute;
+  top: -38%;
+  left: -18%;
+  width: 136%;
+  height: 92%;
+  pointer-events: none;
+  opacity: 0.5;
+  filter: blur(64px);
+  background: conic-gradient(
+    from 0deg,
+    rgba(var(--brand-rgb), 0.34),
+    rgba(var(--violet-rgb), 0.24),
+    rgba(var(--cyan-rgb), 0.2),
+    rgba(var(--brand-rgb), 0.34)
+  );
+  animation: aurora-drift 34s linear infinite;
+}
+
+@keyframes aurora-drift {
+  0% {
+    transform: rotate(0deg) scale(1);
+  }
+  50% {
+    transform: rotate(180deg) scale(1.12);
+  }
+  100% {
+    transform: rotate(360deg) scale(1);
+  }
+}
+
+/* 侧栏顶部的渐变光带 */
+.decor-side-glow {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 260px;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(var(--brand-rgb), 0.1),
+    rgba(var(--violet-rgb), 0.04) 46%,
+    transparent
+  );
+}
+
+/* 旋转的虚线环：配合中心 logo / 图标做「运转中」的暗示 */
+.decor-ring {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  border: 1px dashed rgba(var(--brand-rgb), 0.34);
+  animation: spin-slow 22s linear infinite;
+}
+.decor-ring::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  margin-left: -2.5px;
+  border-radius: 50%;
+  background: var(--brand);
+  box-shadow: 0 0 8px rgba(var(--brand-rgb), 0.7);
+}
+.decor-ring.dashed-soft {
+  border-color: rgba(var(--violet-rgb), 0.26);
+  animation-duration: 34s;
+  animation-direction: reverse;
+}
+
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 呼吸/悬浮 */
+@keyframes float-y {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-7px);
+  }
+}
+
+@keyframes glow-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 /* 入场动画 */

@@ -120,8 +120,9 @@ adminRouter.get('/users/:id', async (req, res) => {
     return
   }
   const s = db.getStore()
-  const usage = (await db.readUsageLogs()).filter((l) => l.user_id === u.id).slice(-50).reverse()
-  const ledger = (await db.readLedger()).filter((l) => l.user_id === u.id).slice(-50).reverse()
+  // 只要最近 50 条：交给 SQL 的索引排序 + LIMIT，不再把整张表读进内存
+  const usage = db.queryUsage({ userId: u.id, limit: 50 })
+  const ledger = db.queryLedger({ userId: u.id, limit: 50 })
   const keys = s.api_keys
     .filter((k) => k.user_id === u.id)
     .map((k) => ({
@@ -899,22 +900,26 @@ adminRouter.put('/docs', async (req, res) => {
 adminRouter.get('/stats', async (_req, res) => {
   const s = db.getStore()
   const from = Date.now() - 30 * 24 * 60 * 60 * 1000
-  const recent = (await db.readUsageLogs()).filter((l) => new Date(l.created_at).getTime() >= from)
-  const cost_cents = recent.reduce((a, l) => a + l.cost_cents, 0)
-  const tokens = recent.reduce((a, l) => a + l.total_tokens, 0)
+  // 全站 30 天聚合：直接在 SQLite 里算，明细不进内存
+  const totals = db.usageTotals({ from })
   const byModel: Record<string, { requests: number; tokens: number; costCents: number }> = {}
-  for (const l of recent) {
-    const k = l.model_slug || 'unknown'
-    if (!byModel[k]) byModel[k] = { requests: 0, tokens: 0, costCents: 0 }
-    byModel[k].requests += 1
-    byModel[k].tokens += l.total_tokens
-    byModel[k].costCents += l.cost_cents
+  for (const r of db.usageByModel({ from })) {
+    byModel[r.model_slug || 'unknown'] = {
+      requests: r.requests,
+      tokens: r.tokens,
+      costCents: r.cost_cents,
+    }
   }
   ok(res, {
     users: s.users.length,
     activeKeys: s.api_keys.filter((k) => !k.revoked_at).length,
     enabledModels: s.models.filter((m) => m.enabled && m.upstream_base_url).length,
-    last30d: { requests: recent.length, tokens, cost_cents, costYuan: centsToYuan(cost_cents) },
+    last30d: {
+      requests: totals.request_count,
+      tokens: totals.total_tokens,
+      cost_cents: totals.cost_cents,
+      costYuan: centsToYuan(totals.cost_cents),
+    },
     byModel,
   })
 })

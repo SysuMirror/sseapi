@@ -238,7 +238,8 @@ export async function appendUsage(
     Math.max(0, Math.floor(promptTokens || 0)),
     Math.max(0, Math.floor(cachedTokens || 0)),
   )
-  db.getStore().usage_logs.push({
+  // 直接落库：用量明细是无限增长的事件表，不再进内存
+  db.insertUsageLog({
     id: db.nextId('usage_logs'),
     user_id: req.user!.id,
     api_key_id: req.apiKeyId ?? null,
@@ -255,6 +256,7 @@ export async function appendUsage(
     prompt: prompt || promptPreview(req),
     created_at: now(),
   })
+  // 余额等小表可能在同一请求里被改过，统一写回
   await db.persist()
 }
 

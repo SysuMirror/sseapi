@@ -53,6 +53,14 @@
         </div>
 
         <div class="actions">
+          <button
+            v-if="(m.modelType || 'chat') === 'chat' && m.enabled"
+            class="btn btn-ghost"
+            type="button"
+            @click="tryModel(m.slug)"
+          >
+            试用
+          </button>
           <button class="btn btn-primary btn-doc" type="button" @click="openDocs">
             API 文档
           </button>
@@ -137,12 +145,18 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { openDocs } from '../store/docs'
 
 const models = ref<any[]>([])
 const expanded = reactive<Record<number, boolean>>({})
 const copied = ref(false)
+const router = useRouter()
+
+function tryModel(slug: string) {
+  router.push({ name: 'playground', query: { model: slug } })
+}
 
 function formatPrice(v: unknown) {
   const n = Number(v)
@@ -182,16 +196,46 @@ onMounted(async () => {
   gap: var(--sp-4);
 }
 .model {
+  position: relative;
   padding: var(--sp-5);
   border-top: 3px solid var(--accent, var(--brand));
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
   transition: box-shadow var(--dur) var(--ease), transform var(--dur) var(--ease);
+  animation: fade-up 0.42s var(--ease) both;
 }
+/* 逐卡错峰入场：卡片依次浮起，比整块同时出现更有节奏 */
+.cards > .model:nth-child(1) { animation-delay: 0.02s; }
+.cards > .model:nth-child(2) { animation-delay: 0.06s; }
+.cards > .model:nth-child(3) { animation-delay: 0.1s; }
+.cards > .model:nth-child(4) { animation-delay: 0.14s; }
+.cards > .model:nth-child(5) { animation-delay: 0.18s; }
+.cards > .model:nth-child(6) { animation-delay: 0.22s; }
+.cards > .model:nth-child(n + 7) { animation-delay: 0.26s; }
 .model:hover {
   box-shadow: var(--shadow-md);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
+}
+/* 卡片右上角的品牌光晕，hover 时点亮 */
+.model::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 190px;
+  height: 120px;
+  pointer-events: none;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--accent, var(--brand)) 16%, transparent),
+    transparent
+  );
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.model:hover::after {
+  opacity: 1;
 }
 .head {
   display: flex;

@@ -8,14 +8,20 @@ import { checkDeveloper, userReqs, isDevPlatformConfigured } from '../services/d
 export const usageRouter = Router()
 usageRouter.use(authJwt)
 
-function matchesStatus(status: string, filters: string[]): boolean {
-  return filters.length === 0 || filters.some((wanted) =>
-    wanted === 'error' ? status !== 'ok' : status === wanted,
-  )
-}
-
 function sinceDays(days: number) {
   return Date.now() - days * 24 * 60 * 60 * 1000
+}
+
+/**
+ * 把「模型类型」筛选翻译成 slug 列表（模型表很小，在 JS 里映射即可）。
+ * 返回 undefined = 不按模型过滤；返回空数组 = 该类型下没有任何模型，
+ * 查询应当恒为空（由 db.usageWhere 里的 1=0 保证）。
+ */
+function typeSlugsOf(filter: string[], modelTypeBySlug: Map<string, string>): string[] | undefined {
+  if (!filter.length) return undefined
+  const out: string[] = []
+  for (const [slug, type] of modelTypeBySlug) if (filter.includes(type)) out.push(slug)
+  return out
 }
 
 /** 用时区本地日期（YYYY-MM-DD）：优先本地时区，避免北京时间凌晨记录归到前一天 */
@@ -56,16 +62,6 @@ function emptyTotals(): AggregateTotals {
     costYuan: 0,
     error_count: 0,
   }
-}
-
-function accountTotals(a: AggregateTotals, l: any): void {
-  a.request_count += 1
-  a.prompt_tokens += l.prompt_tokens || 0
-  a.cached_tokens += l.cached_tokens || 0
-  a.completion_tokens += l.completion_tokens || 0
-  a.total_tokens += l.total_tokens || 0
-  a.cost_cents += l.cost_cents || 0
-  if (l.status && l.status !== 'ok') a.error_count += 1
 }
 
 /** 归一化时间范围（毫秒时间戳） */
@@ -112,113 +108,70 @@ usageRouter.get('/aggregate', async (req: AuthedRequest, res) => {
     modelTypeBySlug.set(m.slug, modelTypeOf(m))
   }
 
-  let logs = (await db.readUsageLogs()).filter((l) => {
-      if (l.user_id !== targetUserId) return false
-      const t = new Date(l.created_at).getTime()
-      if (t < from || t > to) return false
-      if (modelFilter.length && !modelFilter.includes(l.model_slug)) return false
-      if (typeFilter.length) {
-        const mt = modelTypeBySlug.get(l.model_slug) || ''
-        if (!typeFilter.includes(mt)) return false
-      }
-      if (!matchesStatus(l.status, statusFilter)) return false
-      if (apiKeyIdFilter != null && l.api_key_id !== apiKeyIdFilter) return false
-      return true
-    })
+  // 过滤与聚合全部下推到 SQLite：明细行不再进内存，
+  // 接口耗时与历史总量解耦（这是从 JSON 换成 SQLite 的核心目的）
+  const q = {
+    userId: targetUserId,
+    from,
+    to,
+    modelSlugs: modelFilter.length ? modelFilter : typeSlugsOf(typeFilter, modelTypeBySlug),
+    statuses: statusFilter,
+    apiKeyId: apiKeyIdFilter ?? undefined,
+  }
 
-  const totals = logs.reduce(
-    (a: AggregateTotals, l: any) => {
-      accountTotals(a, l)
-      return a
-    },
-    emptyTotals() as AggregateTotals,
-  )
-  totals.costYuan = centsToYuan(totals.cost_cents)
+  const t = db.usageTotals(q)
+  const totals: AggregateTotals = {
+    request_count: t.request_count,
+    prompt_tokens: t.prompt_tokens,
+    cached_tokens: t.cached_tokens,
+    completion_tokens: t.completion_tokens,
+    total_tokens: t.total_tokens,
+    cost_cents: t.cost_cents,
+    costYuan: centsToYuan(t.cost_cents),
+    error_count: t.error_count,
+  }
 
-  // —— 按时间分桶（day / hour）——
-  let byTime: Array<{ bucket: string; tokens: number; requests: number; cost_cents: number; costYuan: number }> = []
-  if (granularity === 'day' || granularity === 'hour') {
-    const bucket = granularity === 'day' ? localDay : localHour
+  const tzOffsetMin = -new Date().getTimezoneOffset()
+
+  /** 先把空桶铺满，保证趋势线连续，再用 SQL 的结果填进去 */
+  const fillBuckets = (
+    rows: Array<{ bucket: string; tokens: number; requests: number; cost_cents: number }>,
+    unit: 'day' | 'hour',
+  ) => {
+    const bucketOf = unit === 'day' ? localDay : localHour
     const timeMap = new Map<string, { tokens: number; requests: number; cost_cents: number }>()
-    let cursor = from
-    // 预先铺满空桶，保证趋势连续（day 用天，hour 用小时）
-    const stepMs = granularity === 'day' ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
-    const bucketOf = (ts: number) => bucket(new Date(ts).toISOString())
+    const stepMs = unit === 'day' ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
     for (let ts = from; ts <= to; ts += stepMs) {
-      const b = bucketOf(ts)
+      const b = bucketOf(new Date(ts).toISOString())
       if (!timeMap.has(b)) timeMap.set(b, { tokens: 0, requests: 0, cost_cents: 0 })
     }
-    for (const l of logs) {
-      const b = bucket(l.created_at)
-      const cur = timeMap.get(b) || { tokens: 0, requests: 0, cost_cents: 0 }
-      cur.tokens += l.total_tokens || 0
-      cur.requests += 1
-      cur.cost_cents += l.cost_cents || 0
-      timeMap.set(b, cur)
+    for (const r of rows) {
+      timeMap.set(r.bucket, { tokens: r.tokens, requests: r.requests, cost_cents: r.cost_cents })
     }
-    byTime = [...timeMap.entries()]
+    return [...timeMap.entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([bucket, v]) => ({ bucket, ...v, costYuan: centsToYuan(v.cost_cents) }))
   }
 
-  // —— 固定按日桶（给趋势图，始终按 day，不受 granularity 影响）——
-  let daily: Array<{ bucket: string; tokens: number; requests: number; cost_cents: number; costYuan: number }> = []
-  {
-    const timeMap = new Map<string, { tokens: number; requests: number; cost_cents: number }>()
-    const stepMs = 24 * 60 * 60 * 1000
-    const bucketOf = (ts: number) => localDay(new Date(ts).toISOString())
-    for (let ts = from; ts <= to; ts += stepMs) {
-      const b = bucketOf(ts)
-      if (!timeMap.has(b)) timeMap.set(b, { tokens: 0, requests: 0, cost_cents: 0 })
-    }
-    for (const l of logs) {
-      const b = localDay(l.created_at)
-      const cur = timeMap.get(b) || { tokens: 0, requests: 0, cost_cents: 0 }
-      cur.tokens += l.total_tokens || 0
-      cur.requests += 1
-      cur.cost_cents += l.cost_cents || 0
-      timeMap.set(b, cur)
-    }
-    daily = [...timeMap.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([bucket, v]) => ({ bucket, ...v, costYuan: centsToYuan(v.cost_cents) }))
-  }
+  const byTime =
+    granularity === 'day' || granularity === 'hour'
+      ? fillBuckets(db.usageByBucket(q, granularity, tzOffsetMin), granularity)
+      : []
 
-  // —— 按模型分组 ——
-  const modelMap = new Map<
-    string,
-    { model_slug: string; model_type: string; tokens: number; cost_cents: number; requests: number; errors: number }
-  >()
-  for (const l of logs) {
-    const cur = modelMap.get(l.model_slug) || {
-      model_slug: l.model_slug,
-      model_type: modelTypeBySlug.get(l.model_slug) || 'unknown',
-      tokens: 0,
-      cost_cents: 0,
-      requests: 0,
-      errors: 0,
-    }
-    cur.tokens += l.total_tokens || 0
-    cur.cost_cents += l.cost_cents || 0
-    cur.requests += 1
-    if (l.status && l.status !== 'ok') cur.errors += 1
-    modelMap.set(l.model_slug, cur)
-  }
-  let byModel = [...modelMap.values()]
-    .sort((a, b) => b.cost_cents - a.cost_cents)
-    .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
+  // 固定按日桶（给趋势图，始终按 day，不受 granularity 影响）
+  const daily = fillBuckets(db.usageByBucket(q, 'day', tzOffsetMin), 'day')
 
-  // —— 按状态分组 ——
-  const statusMap = new Map<string, { status: string; request_count: number; tokens: number; cost_cents: number }>()
-  for (const l of logs) {
-    const st = l.status && l.status === 'ok' ? 'ok' : 'error'
-    const cur = statusMap.get(st) || { status: st, request_count: 0, tokens: 0, cost_cents: 0 }
-    cur.request_count += 1
-    cur.tokens += l.total_tokens || 0
-    cur.cost_cents += l.cost_cents || 0
-    statusMap.set(st, cur)
-  }
-  const byStatus = [...statusMap.values()].map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
+  const byModel = db.usageByModel(q).map((r) => ({
+    model_slug: r.model_slug,
+    model_type: modelTypeBySlug.get(r.model_slug) || 'unknown',
+    tokens: r.tokens,
+    cost_cents: r.cost_cents,
+    requests: r.requests,
+    errors: r.errors,
+    costYuan: centsToYuan(r.cost_cents),
+  }))
+
+  const byStatus = db.usageByStatus(q).map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
 
   // —— request 颗粒度：明细分页 ——
   let items: any[] = []
@@ -228,12 +181,10 @@ usageRouter.get('/aggregate', async (req: AuthedRequest, res) => {
   if (granularity === 'request') {
     page = Math.max(1, Number(req.query.page) || 1)
     pageSize = Math.min(200, Math.max(1, Number(req.query.page_size) || 50))
-    logs = [...logs].sort((a, b) => b.id - a.id)
-    total = logs.length
-    items = logs.slice((page - 1) * pageSize, page * pageSize).map((r) => ({
-      ...r,
-      costYuan: centsToYuan(r.cost_cents),
-    }))
+    total = db.countUsage(q)
+    items = db
+      .queryUsage({ ...q, orderDesc: true, limit: pageSize, offset: (page - 1) * pageSize })
+      .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
   }
 
   ok(res, {
@@ -289,69 +240,54 @@ usageRouter.get('/by-user', async (req: AuthedRequest, res) => {
     return u ? u.oauth_id || '' : ''
   }
 
-  let logs = (await db.readUsageLogs()).filter((l) => {
-    const t = new Date(l.created_at).getTime()
-    if (t < from || t > to) return false
-    if (modelFilter.length && !modelFilter.includes(l.model_slug)) return false
-    if (!matchesStatus(l.status, statusFilter)) return false
-    if (typeFilter.length) {
-      const mt = modelTypeBySlug.get(l.model_slug) || ''
-      if (!typeFilter.includes(mt)) return false
-    }
-    return true
-  })
-
-  // 总览汇总
-  const totals = logs.reduce(
-    (a, l) => {
-      accountTotals(a, l)
-      return a
-    },
-    emptyTotals() as AggregateTotals,
-  )
-  totals.costYuan = centsToYuan(totals.cost_cents)
-
-  const users = Array.from(new Set(logs.map((l) => l.user_id))).sort((a, b) => a - b)
-  const userMap = new Map<
-    number,
-    { user_id: number; name: string; oauthId: string; requests: number; tokens: number; prompt_tokens: number; completion_tokens: number; cached_tokens: number; cost_cents: number; errors: number }
-  >()
-  for (const l of logs) {
-    const cur = userMap.get(l.user_id) || {
-      user_id: l.user_id,
-      name: userName(l.user_id),
-      oauthId: oauthIdOf(l.user_id),
-      requests: 0,
-      tokens: 0,
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      cached_tokens: 0,
-      cost_cents: 0,
-      errors: 0,
-    }
-    cur.requests += 1
-    cur.tokens += l.total_tokens || 0
-    cur.prompt_tokens += l.prompt_tokens || 0
-    cur.completion_tokens += l.completion_tokens || 0
-    cur.cached_tokens += l.cached_tokens || 0
-    cur.cost_cents += l.cost_cents || 0
-    if (l.status && l.status !== 'ok') cur.errors += 1
-    userMap.set(l.user_id, cur)
+  const q = {
+    from,
+    to,
+    modelSlugs: modelFilter.length ? modelFilter : typeSlugsOf(typeFilter, modelTypeBySlug),
+    statuses: statusFilter,
   }
-  let byUser = [...userMap.values()]
-    .sort((a, b) => b.cost_cents - a.cost_cents)
-    .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
+
+  // 总览汇总 + 按用户分组：都在 SQLite 里完成（全站 30 天可能上百万行，
+  // 绝不能搬到 JS 里遍历）
+  const t = db.usageTotals(q)
+  const totals: AggregateTotals = {
+    request_count: t.request_count,
+    prompt_tokens: t.prompt_tokens,
+    cached_tokens: t.cached_tokens,
+    completion_tokens: t.completion_tokens,
+    total_tokens: t.total_tokens,
+    cost_cents: t.cost_cents,
+    costYuan: centsToYuan(t.cost_cents),
+    error_count: t.error_count,
+  }
+
+  let byUser = db.usageByUser(q).map((r) => ({
+    user_id: r.user_id,
+    name: userName(r.user_id),
+    oauthId: oauthIdOf(r.user_id),
+    requests: r.requests,
+    tokens: r.tokens,
+    prompt_tokens: r.prompt_tokens,
+    completion_tokens: r.completion_tokens,
+    cached_tokens: r.cached_tokens,
+    cost_cents: r.cost_cents,
+    errors: r.errors,
+    costYuan: centsToYuan(r.cost_cents),
+  }))
 
   let detail: { page: number; pageSize: number; total: number; items: any[] } | null = null
   if (targetUserId != null) {
     const page = Math.max(1, Number(req.query.page) || 1)
     const pageSize = Math.min(200, Math.max(1, Number(req.query.page_size) || 50))
-    const own = logs.filter((l) => l.user_id === targetUserId).sort((a, b) => b.id - a.id)
-    const items = own.slice((page - 1) * pageSize, page * pageSize).map((r) => ({
-      ...r,
-      costYuan: centsToYuan(r.cost_cents),
-    }))
-    detail = { page, pageSize, total: own.length, items }
+    const own = { ...q, userId: targetUserId }
+    detail = {
+      page,
+      pageSize,
+      total: db.countUsage(own),
+      items: db
+        .queryUsage({ ...own, orderDesc: true, limit: pageSize, offset: (page - 1) * pageSize })
+        .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) })),
+    }
   }
 
   // —— 开发者平台信息（可选，默认开启）：判定每个用户是否集市开发者 + 角色标签 ——
@@ -416,25 +352,20 @@ usageRouter.get('/logs', async (req: AuthedRequest, res) => {
     modelTypeBySlug.set(m.slug, modelTypeOf(m))
   }
 
-  let all = (await db.readUsageLogs()).filter((l) => {
-      if (l.user_id !== userId) return false
-      if (from && new Date(l.created_at).getTime() < from) return false
-      if (modelFilter.length && !modelFilter.includes(l.model_slug)) return false
-      if (typeFilter.length) {
-        const mt = modelTypeBySlug.get(l.model_slug) || ''
-        if (!typeFilter.includes(mt)) return false
-      }
-      if (!matchesStatus(l.status, statusFilter)) return false
-      return true
-    })
-    .sort((a, b) => b.id - a.id)
-
-  const total = all.length
-  const items = all.slice((page - 1) * pageSize, page * pageSize).map((r) => ({
-    ...r,
-    model_type: modelTypeBySlug.get(r.model_slug) || '',
-    costYuan: centsToYuan(r.cost_cents),
-  }))
+  const q = {
+    userId,
+    from: from || undefined,
+    modelSlugs: modelFilter.length ? modelFilter : typeSlugsOf(typeFilter, modelTypeBySlug),
+    statuses: statusFilter,
+  }
+  const total = db.countUsage(q)
+  const items = db
+    .queryUsage({ ...q, orderDesc: true, limit: pageSize, offset: (page - 1) * pageSize })
+    .map((r) => ({
+      ...r,
+      model_type: modelTypeBySlug.get(r.model_slug) || '',
+      costYuan: centsToYuan(r.cost_cents),
+    }))
   ok(res, { page, pageSize, total, items })
 })
 
@@ -483,60 +414,36 @@ usageRouter.get('/summary', async (req: AuthedRequest, res) => {
   const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
   const userId = req.user!.id
   const from = sinceDays(days)
-  const logs = (await db.readUsageLogs()).filter((l) => l.user_id === userId && new Date(l.created_at).getTime() >= from)
+  const q = { userId, from }
 
-  const totals = logs.reduce(
-    (a, l) => {
-      a.prompt_tokens += l.prompt_tokens
-      a.cached_tokens += l.cached_tokens || 0
-      a.completion_tokens += l.completion_tokens
-      a.total_tokens += l.total_tokens
-      a.cost_cents += l.cost_cents
-      a.request_count += 1
-      return a
-    },
-    {
-      prompt_tokens: 0,
-      cached_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-      cost_cents: 0,
-      request_count: 0,
-    },
-  )
-
-  const dayMap = new Map<string, { day: string; tokens: number; cost_cents: number; requests: number }>()
-  for (const l of logs) {
-    const day = localDay(l.created_at)
-    const cur = dayMap.get(day) || { day, tokens: 0, cost_cents: 0, requests: 0 }
-    cur.tokens += l.total_tokens
-    cur.cost_cents += l.cost_cents
-    cur.requests += 1
-    dayMap.set(day, cur)
+  const t = db.usageTotals(q)
+  const totals = {
+    prompt_tokens: t.prompt_tokens,
+    cached_tokens: t.cached_tokens,
+    completion_tokens: t.completion_tokens,
+    total_tokens: t.total_tokens,
+    cost_cents: t.cost_cents,
+    request_count: t.request_count,
   }
-  const byDay = [...dayMap.values()]
-    .sort((a, b) => a.day.localeCompare(b.day))
-    .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
 
-  const modelMap = new Map<
-    string,
-    { model_slug: string; tokens: number; cost_cents: number; requests: number }
-  >()
-  for (const l of logs) {
-    const cur = modelMap.get(l.model_slug) || {
-      model_slug: l.model_slug,
-      tokens: 0,
-      cost_cents: 0,
-      requests: 0,
-    }
-    cur.tokens += l.total_tokens
-    cur.cost_cents += l.cost_cents
-    cur.requests += 1
-    modelMap.set(l.model_slug, cur)
-  }
-  const byModel = [...modelMap.values()]
-    .sort((a, b) => b.cost_cents - a.cost_cents)
-    .map((r) => ({ ...r, costYuan: centsToYuan(r.cost_cents) }))
+  // 按本地日分桶（同样在 SQL 里 GROUP BY）
+  const byDay = db
+    .usageByBucket(q, 'day', -new Date().getTimezoneOffset())
+    .map((r) => ({
+      day: r.bucket,
+      tokens: r.tokens,
+      cost_cents: r.cost_cents,
+      requests: r.requests,
+      costYuan: centsToYuan(r.cost_cents),
+    }))
+
+  const byModel = db.usageByModel(q).map((r) => ({
+    model_slug: r.model_slug,
+    tokens: r.tokens,
+    cost_cents: r.cost_cents,
+    requests: r.requests,
+    costYuan: centsToYuan(r.cost_cents),
+  }))
 
   ok(res, {
     days,

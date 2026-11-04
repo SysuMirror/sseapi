@@ -1,78 +1,148 @@
 import { Router } from 'express'
 import { config, isOAuthConfigured } from '../config.js'
 import {
-  buildAuthorizeUrl,
-  consumeOAuthState,
-  createOAuthState,
-  exchangeCodeForToken,
-  fetchOAuthUserInfo,
-  putSession,
-  takeSession,
+  SsoError,
+  revokeSsoSession,
+  verifyPassword,
+  verifySsoSession,
+  type SsoTicket,
+  type UniSSOProfile,
 } from '../services/oauth.js'
-import { publicUser, upsertUserFromOAuth } from '../services/users.js'
+import { publicUser, upsertUserFromOAuth, type UserRow } from '../services/users.js'
 import { authJwt, ok, fail, signUserToken, type AuthedRequest } from '../middleware/auth.js'
 
 export const authRouter = Router()
 
-authRouter.get('/oauth/config', (_req, res) => {
+const SSO_COOKIE = 'sse_sso'
+const SSO_COOKIE_DOMAIN = '.ssemarket.cn'
+const SSO_MAX_AGE = 604800
+/** 静默登录限流：10 次/分钟/IP（客户端 IP 取自 nginx 传入的 X-Forwarded-For） */
+const SSO_RATE_LIMIT = 10
+const SSO_RATE_WINDOW_MS = 60_000
+const ssoHits = new Map<string, { count: number; resetAt: number }>()
+
+function clientIp(req: { headers: Record<string, unknown>; socket?: { remoteAddress?: string } }): string {
+  const xff = String(req.headers['x-forwarded-for'] || '')
+  const first = xff.split(',')[0]?.trim()
+  return first || req.socket?.remoteAddress || 'unknown'
+}
+
+function hitSsoRateLimit(ip: string): boolean {
+  const nowMs = Date.now()
+  const rec = ssoHits.get(ip)
+  if (!rec || rec.resetAt <= nowMs) {
+    if (ssoHits.size > 5000) ssoHits.clear()
+    ssoHits.set(ip, { count: 1, resetAt: nowMs + SSO_RATE_WINDOW_MS })
+    return false
+  }
+  rec.count += 1
+  return rec.count > SSO_RATE_LIMIT
+}
+
+function readSsoCookie(req: { headers: Record<string, unknown> }): string {
+  const raw = String(req.headers.cookie || '')
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=')
+    if (idx < 0) continue
+    if (part.slice(0, idx).trim() === SSO_COOKIE) {
+      return decodeURIComponent(part.slice(idx + 1).trim())
+    }
+  }
+  return ''
+}
+
+function setSsoCookie(res: { append: (k: string, v: string) => void }, ticket: SsoTicket) {
+  res.append(
+    'Set-Cookie',
+    `${ticket.cookieName}=${encodeURIComponent(ticket.session)}; Domain=${ticket.cookieDomain}; Path=/; Max-Age=${ticket.maxAge}; HttpOnly; Secure; SameSite=Lax`,
+  )
+}
+
+function clearSsoCookie(res: { append: (k: string, v: string) => void }) {
+  res.append(
+    'Set-Cookie',
+    `${SSO_COOKIE}=; Domain=${SSO_COOKIE_DOMAIN}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`,
+  )
+}
+
+function loginPayload(user: UserRow, profile: UniSSOProfile) {
+  return {
+    token: signUserToken(user),
+    user: publicUser(user),
+    profile: {
+      sub: profile.sub,
+      sseUserId: profile.sseSub,
+      name: profile.name,
+      email: profile.email,
+      avatarUrl: profile.avatar_url,
+    },
+  }
+}
+
+// 邮箱+密码登录：后端持 client 凭据调 UniSSO password/verify 代验（无 OAuth 跳转），
+// internal !== true 直接拒绝。成功后把 unisso 下发的共享会话 Cookie 种给浏览器，
+// 其它 .ssemarket.cn 子站据此静默登录。
+authRouter.post('/login', async (req, res) => {
   if (!isOAuthConfigured()) {
-    fail(res, 503, 'OAuth 未配置，请设置 SSEAPI_OAUTH_APP_ID / SECRET / REDIRECT_URI')
+    fail(res, 503, '登录服务未配置，请设置 UNISSO_CLIENT_ID / SECRET')
     return
   }
-  ok(res, {
-    configured: true,
-    provider: config.oauth.baseUrl,
-    appId: config.oauth.appId,
-  })
-})
-
-authRouter.get('/oauth/login-url', async (_req, res) => {
-  if (!isOAuthConfigured()) {
-    fail(res, 503, 'OAuth 未配置')
+  const { email, password } = (req.body || {}) as { email?: string; password?: string }
+  if (!email || !password) {
+    fail(res, 400, '请填写邮箱和密码')
     return
   }
-  const state = await createOAuthState()
-  ok(res, { authorize_url: buildAuthorizeUrl(state), state })
-})
-
-authRouter.post('/oauth/token', async (req, res) => {
-  try {
-    const { code, state } = req.body || {}
-    if (!code || !state) {
-      fail(res, 400, '缺少 code 或 state')
-      return
-    }
-    if (!(await consumeOAuthState(String(state)))) {
-      fail(res, 400, 'state 无效或已过期')
-      return
-    }
-    const token = await exchangeCodeForToken(String(code))
-    const sessionId = putSession(token.access_token)
-    ok(res, { session_id: sessionId })
-  } catch (e) {
-    fail(res, 400, e instanceof Error ? e.message : '换票失败')
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    fail(res, 400, '邮箱格式不正确')
+    return
   }
-})
-
-authRouter.post('/oauth/userinfo', async (req, res) => {
   try {
-    const { session_id: sessionId } = req.body || {}
-    if (!sessionId) {
-      fail(res, 400, '缺少 session_id')
-      return
-    }
-    const accessToken = takeSession(String(sessionId))
-    if (!accessToken) {
-      fail(res, 400, 'session 无效或已过期')
-      return
-    }
-    const profile = await fetchOAuthUserInfo(accessToken)
+    const { profile, sso } = await verifyPassword(email, password)
     const user = await upsertUserFromOAuth(profile)
-    const token = signUserToken(user)
-    ok(res, { token, user: publicUser(user), profile })
+    if (sso) setSsoCookie(res, sso)
+    ok(res, loginPayload(user, profile))
   } catch (e) {
-    fail(res, 400, e instanceof Error ? e.message : '登录失败')
+    fail(res, 401, e instanceof Error ? e.message : '登录失败')
   }
+})
+
+// 静默 SSO：读共享父域 Cookie → unisso 校验 → 本地 upsert → 签本地 JWT。
+// 401/503 都让前端静默回落到登录表单；本端点不重新下发 SSO Cookie。
+authRouter.post('/sso/try', async (req, res) => {
+  if (!isOAuthConfigured()) {
+    fail(res, 503, 'sso_unavailable')
+    return
+  }
+  if (hitSsoRateLimit(clientIp(req))) {
+    fail(res, 429, 'too_many_requests')
+    return
+  }
+  const session = readSsoCookie(req)
+  if (!session) {
+    fail(res, 401, 'no_sso')
+    return
+  }
+  try {
+    const profile = await verifySsoSession(session)
+    const user = await upsertUserFromOAuth(profile)
+    ok(res, loginPayload(user, profile))
+  } catch (e) {
+    if (e instanceof SsoError) {
+      if (e.kind === 'unavailable') fail(res, 503, 'sso_unavailable')
+      else if (e.kind === 'forbidden') fail(res, 401, 'not_internal')
+      else fail(res, 401, 'invalid_sso')
+      return
+    }
+    fail(res, 503, 'sso_unavailable')
+  }
+})
+
+// 单点登出：撤销 unisso 会话 + 清父域 Cookie + 清本地 JWT（无状态，前端负责）。
+authRouter.post('/logout', async (req, res) => {
+  const session = readSsoCookie(req)
+  if (session) await revokeSsoSession(session)
+  clearSsoCookie(res)
+  ok(res, { ok: true })
 })
 
 authRouter.get('/me', authJwt, (req: AuthedRequest, res) => {

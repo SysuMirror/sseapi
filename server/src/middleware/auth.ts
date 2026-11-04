@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken'
 import { config } from '../config.js'
 import { db, hashToken, now } from '../db.js'
 import { getUserById, type UserRow } from '../services/users.js'
+import { marketUserId, userIsDeveloper } from '../services/dev-platform.js'
 
 export type AuthedRequest = Request & {
   user?: UserRow
@@ -32,12 +33,15 @@ export async function authJwt(req: AuthedRequest, res: Response, next: NextFunct
       return
     }
     // 内置/环境种子管理员：每次鉴权时抬权（无需重新 OAuth）
-    if (!user.is_admin && config.platformAdminOauthIds.has(user.oauth_id)) {
+    if (!user.is_admin && config.platformAdminSubs.has(user.oauth_id)) {
       user.is_admin = 1
       user.updated_at = now()
       await db.persist()
     }
     req.user = user
+    // 后台预热「集市开发者」身份缓存：模型列表要据此判断 dev_only 可见性，
+    // 预热后首个 /api/models 不必自己等一次外部 HTTP（最长 8s）。
+    if (!user.is_admin) void userIsDeveloper(marketUserId(user))
     next()
   } catch {
     res.status(401).json({ code: 401, message: '登录已失效' })

@@ -21,9 +21,9 @@ Vue 3 + Express + JSON 文件存储（`DATA_DIR/sseapi-store.json`）+ 集市 OA
 
 ## 本地开发
 
-```powershell
+```bash
 cd server
-copy .env.example .env   # 填 OAuth 与 JWT
+cp .env.example .env   # 填 OAuth 与 JWT
 npm install
 npm run dev
 
@@ -61,7 +61,6 @@ curl https://api.ssemarket.cn/v1/chat/completions \
   -d '{"model":"qwen2-7b","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- auto-deploy test 1789473180 -->
-<!-- auto-deploy test 1789474586 -->
+### 日志
 
-<!-- auto-deploy test: 2026-09-15T12:22:47Z -->
+线上统一写在 `/home/cloud/deploy/logs/`（`ai-platform-prod-stdout.log`、`ai-platform-prod-stderr.log`，由 supervisord 轮转）。

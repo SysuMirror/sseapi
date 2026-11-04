@@ -40,17 +40,17 @@ const userActive = new Map<string, number>()
 const keyActive = new Map<string, number>()
 let withoutModel = 0
 
-/** Observe admitted requests independently of configured limits. */
-export function trackEndpoint(endpointName: string, req: AuthedRequest, res: Response, modelSlug?: string) {
+/**
+ * 记录端点/全局维度（仅用于面板展示「在处理什么」）。
+ * 用户/模型/密钥维度由 enforceRateLimits 在「准入时刻」统一计数，
+ * 保证面板数字与限流闸门一致，避免出现「面板 0、却被 429」的错觉。
+ */
+export function trackEndpoint(endpointName: string, req: AuthedRequest, res: Response, _modelSlug?: string) {
   if (req.aborted || res.destroyed || res.writableEnded) return () => {}
   const dimensions: Array<[Map<string, number>, string]> = [
     [globalActive, 'all'],
     [endpointActive, endpointName || 'unknown'],
   ]
-  if (modelSlug) dimensions.push([modelActive, modelSlug])
-  else withoutModel++
-  if (req.user) dimensions.push([userActive, String(req.user.id)])
-  if (req.apiKeyId != null) dimensions.push([keyActive, String(req.apiKeyId)])
   for (const [map, key] of dimensions) map.set(key, (map.get(key) || 0) + 1)
   let released = false
   const release = () => {
@@ -63,7 +63,6 @@ export function trackEndpoint(endpointName: string, req: AuthedRequest, res: Res
       if (current <= 1) map.delete(key)
       else map.set(key, current - 1)
     }
-    if (!modelSlug) withoutModel--
   }
   res.once('close', release)
   res.once('finish', release)
@@ -129,7 +128,12 @@ export function getRuntimeStatus() {
     keys: Object.entries(keyMap)
       .map(([id, v]) => ({ id, current: v.current, limit: v.limit }))
       .sort((a, b) => b.current - a.current),
-    defaults: { rpm: normalizeLimit(cfg.default_rpm), maxConcurrent: normalizeLimit(cfg.default_max_concurrent) },
+    defaults: {
+      rpm: normalizeLimit(cfg.default_rpm),
+      maxConcurrent: normalizeLimit(cfg.default_max_concurrent),
+      // 没有任何一层单独设限时，默认层会兜底并可能拦请求；这里给它一个「当前」
+      current: concurrentCounts.get('conc:default') || 0,
+    },
   }
 }
 
@@ -199,11 +203,10 @@ function buildChecks(
   }
 
   // 默认值仅在「没有任何一层显式设置」时兜底。
-  // 若某层显式设置了更高值（如模型=100），默认值（=2）不会再压低它。
+  // 若某层显式设置了更高值（如模型=100），默认值（=50）不会再压低它。
   const anyRpm = checks.some((c) => c.rpm > 0)
   const anyConc = checks.some((c) => c.maxConcurrent > 0)
   const result = checks.filter((c) => c.rpm > 0 || c.maxConcurrent > 0)
-  if (result.length === 0) return result
   if (!anyRpm && cfg.default_rpm > 0) {
     result.push({
       label: '全局限流',
@@ -268,13 +271,19 @@ export function releaseConcurrent(key: string) {
   else concurrentCounts.set(key, cur - 1)
 }
 
-function send429(res: Response, message: string, retryAfter: number) {
+function send429(
+  res: Response,
+  message: string,
+  retryAfter: number,
+  detail?: { dimension: string; current: number; limit: number },
+) {
   res.setHeader('Retry-After', String(retryAfter))
   res.status(429).json({
     error: {
       message,
       type: 'rate_limit_exceeded',
       code: 'rate_limit_exceeded',
+      ...(detail ? { dimension: detail.dimension, current: detail.current, limit: detail.limit } : {}),
     },
   })
 }
@@ -284,53 +293,85 @@ function send429(res: Response, message: string, retryAfter: number) {
  * @returns true=放行；false=已拒绝
  */
 export function enforceRateLimits(req: AuthedRequest, res: Response, modelSlug?: string): boolean {
-  if (!isRateLimitEnabled()) return true
-
   const user = req.user
   if (!user) return true
 
   const store = db.getStore()
   const keyRow = store.api_keys.find((k) => k.id === req.apiKeyId)
   const model = modelSlug ? store.models.find((m) => m.slug === modelSlug) : undefined
-  const checks = buildChecks(user, keyRow, model)
-  if (!checks.length) return true
 
-  const consumedRpm: string[] = []
-  for (const c of checks) {
-    if (c.rpm <= 0) continue
-    const r = tryConsumeRpm(c.rpmKey, c.rpm)
-    if (!r.ok) {
-      for (const k of consumedRpm) rollbackRpm(k)
-      send429(res, `${c.label}请求过于频繁（RPM ${c.rpm}）`, r.retryAfter)
-      return false
+  // 限流关闭时不做拦截，但下面仍照常记账（面板要能看到谁在跑；被 429 拒绝的不计）。
+  const acquiredConc: LimitCheck[] = []
+  if (isRateLimitEnabled()) {
+    const checks = buildChecks(user, keyRow, model)
+
+    const consumedRpm: string[] = []
+    for (const c of checks) {
+      if (c.rpm <= 0) continue
+      const r = tryConsumeRpm(c.rpmKey, c.rpm)
+      if (!r.ok) {
+        for (const k of consumedRpm) rollbackRpm(k)
+        logRejected(req, modelSlug, `${c.label} RPM 上限 ${c.rpm}`)
+        send429(res, `${c.label}请求过于频繁（RPM ${c.rpm}）`, r.retryAfter)
+        return false
+      }
+      consumedRpm.push(c.rpmKey)
     }
-    consumedRpm.push(c.rpmKey)
+
+    for (const c of checks) {
+      if (c.maxConcurrent <= 0) continue
+      if (!tryAcquireConcurrent(c.concKey, c.maxConcurrent)) {
+        for (const k of consumedRpm) rollbackRpm(k)
+        for (const a of acquiredConc) releaseConcurrent(a.concKey)
+        const holding = concurrentCounts.get(c.concKey) || 0
+        logRejected(req, modelSlug, `${c.label} 并发 ${holding}/${c.maxConcurrent}`)
+        send429(res, `${c.label}并发已满（上限 ${c.maxConcurrent}）`, 1, {
+          dimension: c.concKey,
+          current: holding,
+          limit: c.maxConcurrent,
+        })
+        return false
+      }
+      acquiredConc.push(c)
+    }
   }
 
-  const acquiredConc: string[] = []
-  for (const c of checks) {
-    if (c.maxConcurrent <= 0) continue
-    if (!tryAcquireConcurrent(c.concKey, c.maxConcurrent)) {
-      for (const k of consumedRpm) rollbackRpm(k)
-      for (const k of acquiredConc) releaseConcurrent(k)
-      send429(res, `${c.label}并发已满（上限 ${c.maxConcurrent}）`, 1)
-      return false
-    }
-    acquiredConc.push(c.concKey)
-  }
+  // —— 面板观测：与闸门同刻开始计数（准入），随响应结束一起释放 ——
+  // 即：面板里的「当前」就是占着并发额度的请求，面板为 0 就不会被并发拒绝。
+  const observed: Array<[Map<string, number>, string]> = []
+  if (modelSlug) observed.push([modelActive, modelSlug])
+  else withoutModel++
+  if (req.user) observed.push([userActive, String(req.user.id)])
+  if (req.apiKeyId != null) observed.push([keyActive, String(req.apiKeyId)])
 
-  if (acquiredConc.length) {
-    let released = false
-    const releaseAll = () => {
-      if (released) return
-      released = true
-      for (const k of acquiredConc) releaseConcurrent(k)
+  for (const [map, key] of observed) map.set(key, (map.get(key) || 0) + 1)
+
+  let released = false
+  const releaseAll = () => {
+    if (released) return
+    released = true
+    res.off('close', releaseAll)
+    res.off('finish', releaseAll)
+    for (const c of acquiredConc) releaseConcurrent(c.concKey)
+    for (const [map, key] of observed) {
+      const current = map.get(key) || 0
+      if (current <= 1) map.delete(key)
+      else map.set(key, current - 1)
     }
-    res.once('close', releaseAll)
-    res.once('finish', releaseAll)
+    if (!modelSlug) withoutModel--
   }
+  res.once('close', releaseAll)
+  res.once('finish', releaseAll)
 
   return true
+}
+
+/** 429 是「配置/流量」问题，日志里要能查得到：发生在谁、哪个模型、哪一层。 */
+function logRejected(req: AuthedRequest, modelSlug: string | undefined, reason: string) {
+  const who = req.user ? `${req.user.id}(${req.user.name || ''})` : '?'
+  console.warn(
+    `[ratelimit] 429 model=${modelSlug || '-'} user=${who} key=${req.apiKeyId ?? '-'} path=${req.originalUrl || req.url || '-'} reason=${reason}`,
+  )
 }
 
 export function mapRateLimitsPublic(cfg: RateLimitsConfig) {

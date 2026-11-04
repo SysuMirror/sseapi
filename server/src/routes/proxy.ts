@@ -44,6 +44,7 @@ import {
   countClaudeImages,
   estimateClaudeTokens,
   claudeStreamStartEvents,
+  claudeStreamEndEvents,
   ClaudeContentStream,
   ClaudePassthroughSse,
   upstreamErrorToClaude,
@@ -56,12 +57,17 @@ import {
 import {
   responsesRequestToOpenAi,
   openAiResponseToResponses,
-  openAiStreamChunkToResponses,
+  ResponsesStreamBuilder,
+  upstreamErrorToResponses,
+  sseBlockIsErrorPayload,
 } from '../services/responses-adapter.js'
 import { mayAccessDevOnly } from '../services/dev-platform.js'
 import { anthropicHasOwnUpstream, responsesHasOwnUpstream } from '../services/model-catalog.js'
 
 export const proxyRouter = Router()
+
+/** SSE 事件块分隔符：上游有 LF 也有 CRLF（nginx/部分网关会改写） */
+const SSE_BLOCK_SEP = /\r\n\r\n|\n\n/
 
 function extractUsageFromSse(buf: string): {
   prompt: number
@@ -845,27 +851,36 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
           res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
         }
       }
-      // 解析 SSE：按 event:/data: 成对切分交给转换器重建
-      const flushSse = () => {
-        const lines = buf.split('\n')
-        buf = lines.pop() || ''
-        let curEvent = ''
-        let curData = ''
+      // 解析 SSE：按 event:/data: 成对切分交给转换器重建。
+      // event/data 必须跨 read 边界保留：一个事件名或 data 行被 TCP 分片切开时，
+      // 若把它们放在函数内局部变量里，下一次调用就丢了，等空行到达时
+      // pushEvent('' , …) 匹配不到任何分支 → 整个事件被静默丢弃。
+      // 大段的 content_block_delta 正文恰好是最容易被切开的，于是表现为「只剩 thinking」。
+      let curEvent = ''
+      let curData = ''
+      const dispatch = () => {
+        let dataObj: unknown = null
+        try {
+          dataObj = JSON.parse(curData)
+        } catch {
+          dataObj = curData
+        }
+        writeEvents(passthrough.pushEvent(curEvent, dataObj as Record<string, unknown>))
+        curEvent = ''
+        curData = ''
+      }
+      const flushSse = (final = false) => {
+        // 收尾时把残留在 buf 里的最后一行也当成完整行处理
+        const source = final && buf && !buf.endsWith('\n') ? `${buf}\n` : buf
+        const lines = source.split('\n')
+        if (final) buf = ''
+        else buf = lines.pop() || ''
         for (const line of lines) {
           if (line.startsWith('event:')) curEvent = line.slice(6).trim()
           else if (line.startsWith('data:')) curData = line.slice(5).trim()
-          if (curData && (line === '' || line === '\r')) {
-            let dataObj: unknown = null
-            try {
-              dataObj = JSON.parse(curData)
-            } catch {
-              dataObj = curData
-            }
-            writeEvents(passthrough.pushEvent(curEvent, dataObj as Record<string, unknown>))
-            curEvent = ''
-            curData = ''
-          }
+          if (curData && (line === '' || line === '\r')) dispatch()
         }
+        if (final && curData) dispatch()
       }
       try {
         while (true) {
@@ -874,9 +889,9 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
           buf += decoder.decode(value, { stream: true })
           flushSse()
         }
-        writeEvents(passthrough.finish())
         buf += decoder.decode()
-        flushSse()
+        flushSse(true)
+        writeEvents(passthrough.finish())
       } finally {
         res.end()
       }
@@ -1039,6 +1054,19 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
       res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
     }
 
+    let streamDone = false
+    // 上游常在 HTTP 200 的 SSE 里塞 {"error":{...}}（配额耗尽、上游网关 502 等）。
+    // 直接当成正常 chunk 处理，客户端只会收到一条「成功但没有内容」的消息，
+    // 看起来就是「有 thinking 无内容 / 空回复」。首个载荷就报错时按错误收尾。
+    let upstreamErrMsg: string | null = null
+    let emittedAny = false
+    const writeEvents = (events: Array<{ event: string; data: Record<string, unknown> }>) => {
+      if (events.length) emittedAny = true
+      for (const ev of events) {
+        res.write(`event: ${ev.event}\n`)
+        res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
+      }
+    }
     try {
       while (true) {
         const { done, value } = await reader.read()
@@ -1052,6 +1080,13 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
           if (!t.startsWith('data:')) continue
           const data = t.slice(5).trim()
           if (!data || data === '[DONE]') continue
+          if (!emittedAny && !streamDone) {
+            const errMsg = sseBlockIsErrorPayload(`data: ${data}`)
+            if (errMsg) {
+              upstreamErrMsg = errMsg
+              break
+            }
+          }
           let j: unknown = null
           try {
             j = JSON.parse(data)
@@ -1069,6 +1104,10 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
           // 累计输出文本，用于无 usage 时估算 output_tokens
           const txt = String((j as { choices?: Array<{ delta?: { content?: unknown } }> })?.choices?.[0]?.delta?.content ?? '')
           if (txt) collectedText += txt
+          // 流已结束：本批剩余行仍要读 usage（upstream 常把 usage 放在 finish 之后的
+          // 单独一个 chunk 里，一见 finish 就 break 会把它丢掉、结算退回估算值），
+          // 但不再产出事件。
+          if (streamDone) continue
           // output_tokens：优先上游真实值，其次按文本长度估算
           const outTokens = usageU.found && usageU.completion > 0 ? usageU.completion : Math.ceil(collectedText.length / 4)
           const { events, done: chunkDone } = openAiStreamChunkToClaude(
@@ -1079,12 +1118,25 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
             },
             contentStream,
           )
-          for (const ev of events) {
-            res.write(`event: ${ev.event}\n`)
-            res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
-          }
-          if (chunkDone) break
+          writeEvents(events)
+          if (chunkDone) streamDone = true
         }
+        if (streamDone || upstreamErrMsg) break
+      }
+      if (upstreamErrMsg) {
+        // 已经发过 message_start，用 error 事件收尾；不要再补 message_stop，
+        // 否则客户端会把这次失败当成一条空回复。
+        writeEvents([
+          {
+            event: 'error',
+            data: upstreamErrorToClaude(502, JSON.stringify({ error: { message: upstreamErrMsg } })) as unknown as Record<string, unknown>,
+          },
+        ])
+      } else if (!streamDone) {
+        // 上游没给 finish_reason 就断流时，必须自己补上收尾事件：
+        // 客户端（Claude Code）以 message_stop 作为「这条消息结束」的信号，
+        // 少了它会把整段正文丢弃，只剩 thinking 块。
+        writeEvents(claudeStreamEndEvents(contentStream, { input_tokens: inputTokens }))
       }
     } finally {
       // 流式响应收尾：把本次 reasoning_content 记入缓存，供下一轮回传补挂。
@@ -1117,8 +1169,8 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
         usage.cached,
         usage.imageTokens,
         imageCount,
-        upstreamRes.ok ? 'ok' : 'error',
-        usage.found ? '' : 'usage_estimated',
+        upstreamErrMsg || !upstreamRes.ok ? 'error' : 'ok',
+        upstreamErrMsg ? upstreamErrMsg.slice(0, 500) : usage.found ? '' : 'usage_estimated',
       )
     } catch {
       /* 流已结束 */
@@ -1304,22 +1356,18 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
 
     const contentType = upstreamRes.headers.get('content-type') || ''
     const isStream = wantStream || contentType.includes('text/event-stream')
-    // —— 上游非 200：不包装 SSE，规范化为 Anthropic 错误返回 ——
+    // —— 上游非 200：原样透传真实状态码 + Responses 形状错误体 ——
+    // 不用 200 + SSE 包错误：那会让 Responses 客户端把错误当普通事件吞掉；
+    // 保留真实状态码（尤其 429/503 + Retry-After）客户端才能正确重试。
     if (upstreamRes.status !== 200) {
       const errText = await upstreamRes.text().catch(() => '')
-      const claudeErr = upstreamErrorToClaude(upstreamRes.status, errText)
-      if (wantStream) {
-        res.status(200)
-        res.setHeader('Content-Type', 'text/event-stream')
-        res.setHeader('Cache-Control', 'no-cache')
-        res.write(`event: error\ndata: ${JSON.stringify(claudeErr)}\n\n`)
-        res.end()
-      } else {
-        res.status(upstreamRes.status)
-        res.setHeader('Content-Type', 'application/json')
-        res.send(JSON.stringify(claudeErr))
-      }
-      await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', claudeErr.error.message.slice(0, 500))
+      const errBody = upstreamErrorToResponses(upstreamRes.status, errText)
+      const retryAfter = upstreamRes.headers.get('retry-after')
+      if (retryAfter) res.setHeader('Retry-After', retryAfter)
+      res.status(upstreamRes.status)
+      res.setHeader('Content-Type', 'application/json')
+      res.send(JSON.stringify(errBody))
+      await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', errBody.error.message.slice(0, 500))
       return
     }
     if (isStream) {
@@ -1327,6 +1375,9 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
+      // 避免 nginx 等反向代理缓冲 SSE
+      res.setHeader('X-Accel-Buffering', 'no')
+      res.flushHeaders()
       const reader = upstreamRes.body?.getReader()
       if (!reader) {
         res.end()
@@ -1334,17 +1385,52 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
       }
       const decoder = new TextDecoder()
       let buf = ''
+      // 完整流文本，用于事后提取 usage（buf 会被逐块消费掉，不能复用）
+      let allText = ''
+      let forwarded = false
+      let upstreamErrorMsg: string | null = null
       try {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
-          buf += decoder.decode(value, { stream: true })
-          res.write(value)
+          const chunk = decoder.decode(value, { stream: true })
+          buf += chunk
+          allText += chunk
+          // 按空行切事件块，检查上游是否「200 + SSE 里塞错误」；
+          // 是则规范成 response.failed，否则原样转发（保持纯透传语义）。
+          // 分隔符要同时认 \n\n 与 \r\n\r\n：只找 \n\n 的话，CRLF 上游永远切不出块，
+          // 整条流会被攒到最后一次性吐出——对客户端就是「一直没响应」。
+          let m: RegExpExecArray | null
+          while ((m = SSE_BLOCK_SEP.exec(buf)) !== null) {
+            const sep = m.index
+            const block = buf.slice(0, sep + m[0].length)
+            buf = buf.slice(sep + m[0].length)
+            const errMsg = forwarded ? null : sseBlockIsErrorPayload(block)
+            if (errMsg) {
+              upstreamErrorMsg = errMsg
+              break
+            }
+            forwarded = true
+            res.write(block)
+          }
+          if (upstreamErrorMsg) break
+        }
+        if (upstreamErrorMsg) {
+          const failed = new ResponsesStreamBuilder(`resp_${Date.now().toString(36)}`, String(body.model ?? modelSlug)).fail(upstreamErrorMsg)
+          for (const ev of failed) {
+            res.write(`event: ${ev.event}\ndata: ${JSON.stringify(ev.data)}\n\n`)
+          }
+        } else if (buf) {
+          res.write(buf)
         }
       } finally {
         res.end()
       }
-      const usage = readUsage(extractUsageFromSse(buf))
+      const usage = readUsage(extractUsageFromSse(allText))
+      if (upstreamErrorMsg) {
+        await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', upstreamErrorMsg.slice(0, 500))
+        return
+      }
       try {
         await settleBilling(
           req,
@@ -1471,20 +1557,38 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     let inputTokens = 0
     let completionTokens = 0
     let cachedTokens = 0
-    let collectedOutput = ''
 
-    // 起始事件
-    res.write(`event: response.created\n`)
-    res.write(
-      `data: ${JSON.stringify({
-        type: 'response.created',
-        response: { id: runId, object: 'response', status: 'in_progress', output: [] },
-      })}\n\n`,
-    )
+    // Chat 流 → Responses 流。事件有生命周期（item added → delta → done），
+    // 必须跨 chunk 累积状态；并保证一定以 response.completed/failed 收尾。
+    const builder = new ResponsesStreamBuilder(runId, String(body.model ?? modelSlug))
+    const writeEvents = (events: Array<{ event: string; data: Record<string, unknown> }>) => {
+      for (const ev of events) {
+        res.write(`event: ${ev.event}\n`)
+        res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
+      }
+    }
+    writeEvents(builder.start())
+
+    // finish_reason 之后通常还有一块「只带 usage」的 chunk（OpenAI 规范就是这样排的）。
+    // 一见 finish_reason 就 break 会把它丢掉：客户端在 response.completed 里看到
+    // usage 全 0，计费也只能退回估算。所以 finish 之后要继续读到流自然结束；
+    // 但也不能无限等（有些上游 finish 后不关流），finish 之后再等 3s 就收尾。
+    let sawFinish = false
+    let graceTimer: NodeJS.Timeout | null = null
+    const graceExpire = () =>
+      new Promise<{ done: true; value: undefined; timedOut: true }>((resolve) => {
+        graceTimer = setTimeout(() => resolve({ done: true, value: undefined, timedOut: true }), 3000)
+      })
 
     try {
       while (true) {
-        const { done, value } = await reader.read()
+        const read = reader.read().then((r) => ({ ...r, timedOut: false }))
+        const raced = sawFinish ? await Promise.race([read, graceExpire()]) : await read
+        if (raced.timedOut) {
+          reader.cancel().catch(() => {})
+          break
+        }
+        const { done, value } = raced
         if (done) break
         buf += decoder.decode(value, { stream: true })
         const lines = buf.split('\n')
@@ -1500,6 +1604,14 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
           } catch {
             continue
           }
+          // 上游用 200 + SSE 传错误体（不少反代这么做）：转成 response.failed，
+          // 否则客户端只会看到「流在 completed 之前结束」这种无信息量的报错。
+          const errObj = (j as { error?: unknown }).error
+          if (errObj && typeof errObj === 'object') {
+            const em = String((errObj as Record<string, unknown>).message ?? '上游返回错误')
+            writeEvents(builder.fail(em, String((errObj as Record<string, unknown>).type ?? 'upstream_error')))
+            break
+          }
           const usageU = readUsage((j as { usage?: unknown })?.usage)
           if (usageU.found) {
             usageFound = true
@@ -1507,27 +1619,24 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
             completionTokens = usageU.completion
             cachedTokens = usageU.cached
           }
-          // 累计输出文本，用于无 usage 时估算 completion tokens
-          const dTxt = String((j as { choices?: Array<{ delta?: { content?: unknown } }> })?.choices?.[0]?.delta?.content ?? '')
-          if (dTxt) collectedOutput += dTxt
-          const { events, done: chunkDone } = openAiStreamChunkToResponses(j as Record<string, unknown>, runId)
-          for (const ev of events) {
-            res.write(`event: ${ev.event}\n`)
-            res.write(`data: ${JSON.stringify(ev.data)}\n\n`)
-          }
-          if (chunkDone) break
+          const { events, done: chunkDone } = builder.push(j as Record<string, unknown>)
+          writeEvents(events)
+          if (chunkDone) sawFinish = true
         }
+        if (builder.isTerminated) break
       }
+      if (!builder.isTerminated) writeEvents(builder.finish())
     } finally {
+      if (graceTimer) clearTimeout(graceTimer)
       res.end()
     }
 
     let usage = { prompt: 0, completion: 0, cached: 0, imageTokens: 0, found: false }
     if (usageFound) {
-      const out = completionTokens > 0 ? completionTokens : Math.ceil(collectedOutput.length / 4)
+      const out = completionTokens > 0 ? completionTokens : Math.ceil(builder.outputText.length / 4)
       usage = { prompt: inputTokens, completion: out, cached: cachedTokens, imageTokens: 0, found: true }
     } else {
-      const est = estimateTokens(inputForImage, collectedOutput)
+      const est = estimateTokens(inputForImage, builder.outputText)
       usage = { ...est, found: false }
     }
     try {

@@ -13,7 +13,6 @@ export interface User {
 const TOKEN_KEY = 'sseapi_token'
 const USER_KEY = 'sseapi_user'
 const REDIRECT_KEY = 'sseapi_redirect'
-const OAUTH_PENDING_KEY = 'sseapi_oauth_pending'
 
 export const auth = reactive<{ token: string; user: User | null }>({
   token: localStorage.getItem(TOKEN_KEY) || '',
@@ -54,14 +53,38 @@ export function consumeRedirect(): string {
   return p
 }
 
-export function markOAuthPending() {
-  sessionStorage.setItem(OAUTH_PENDING_KEY, '1')
-}
+/**
+ * 每次页面加载向 unisso 复核共享 SSO Cookie 一次（无论本地有没有 token）：
+ * - 200：刷新本地会话（顺带完成「无 token 时静默登录」）
+ * - 401：Cookie 已失效/已被其它平台单点登出 → 清本地会话，回登录页
+ * - 503/429/网络：unisso 暂时不可达 → 保留本地会话，不把已登录用户踢下线
+ */
+export type SsoCheck = 'ok' | 'invalid' | 'unavailable'
 
-export function clearOAuthPending() {
-  sessionStorage.removeItem(OAUTH_PENDING_KEY)
-}
+let ssoCheck: Promise<SsoCheck> | null = null
+let ssoChecked = false
 
-export function isOAuthPending(): boolean {
-  return sessionStorage.getItem(OAUTH_PENDING_KEY) === '1'
+export function revalidateSso(): Promise<SsoCheck> {
+  if (ssoCheck) return ssoCheck
+  if (ssoChecked) return Promise.resolve(isLoggedIn() ? 'ok' : 'invalid')
+  ssoCheck = (async () => {
+    try {
+      // 动态引入避免 store ↔ api 的循环依赖
+      const { api } = await import('../api')
+      const data = await api.ssoTry()
+      setAuth(data.token, data.user)
+      return 'ok'
+    } catch (e) {
+      const status = (e as { status?: number }).status
+      if (status === 401) {
+        clearAuth()
+        return 'invalid'
+      }
+      return 'unavailable'
+    } finally {
+      ssoChecked = true
+      ssoCheck = null
+    }
+  })()
+  return ssoCheck
 }

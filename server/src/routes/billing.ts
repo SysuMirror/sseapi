@@ -23,9 +23,15 @@ function isGrantForDate(createdAt: string, date: string): boolean {
 }
 async function grantStatus(userId: number) {
   const date = shanghaiDate()
-  const ledger = await db.readLedger()
+  // 只看最近两天的流水就够了（isGrantForDate 只关心「今天」），
+  // 交给 SQL 用 (user_id, ts) 索引取，不必把整张表读进来
+  const ledger = db.queryLedger({
+    userId,
+    from: Date.now() - 48 * 60 * 60 * 1000,
+    kinds: ['daily', 'peak', 'checkin'],
+  })
   const has = (kind: GrantKind | 'checkin') => ledger.some(
-    (l) => l.user_id === userId && l.kind === kind && isGrantForDate(l.created_at, date),
+    (l) => l.kind === kind && isGrantForDate(l.created_at, date),
   )
   return { date, dailyClaimed: has('daily') || has('checkin'), peakClaimed: has('peak'), peakAvailable: isPeakWindow() }
 }
@@ -35,15 +41,18 @@ billingRouter.use(authJwt)
 
 billingRouter.get('/summary', async (req: AuthedRequest, res) => {
   const userId = req.user!.id
-  const ledger = (await db.readLedger()).filter((l) => l.user_id === userId)
-  const usageLogs = (await db.readUsageLogs()).filter((l) => l.user_id === userId && l.status === 'ok')
+  // 充值/消费都是全时段累计，交给 SQL 聚合出两个数字
+  const credited = db.ledgerSum({
+    userId,
+    kinds: ['credit', 'checkin', 'daily', 'peak'],
+    positiveOnly: true,
+  })
+  const totals = db.usageTotals({ userId, onlyOk: true })
 
-  const totalCredited = ledger
-    .filter((l) => ['credit', 'checkin', 'daily', 'peak'].includes(l.kind) && l.amount_cents > 0)
-    .reduce((a, l) => a + l.amount_cents, 0)
-  const totalSpent = usageLogs.reduce((a, l) => a + l.cost_cents, 0)
-  const totalRequests = usageLogs.length
-  const totalTokens = usageLogs.reduce((a, l) => a + l.total_tokens, 0)
+  const totalCredited = credited.total
+  const totalSpent = totals.cost_cents
+  const totalRequests = totals.request_count
+  const totalTokens = totals.total_tokens
 
   ok(res, {
     balanceCents: req.user!.balance_cents,
@@ -95,13 +104,14 @@ billingRouter.post('/checkin', async (req: AuthedRequest, res, next) => {
 billingRouter.get('/ledger', async (req: AuthedRequest, res) => {
   const page = Math.max(1, Number(req.query.page) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size) || 20))
-  const all = (await db.readLedger()).filter((l) => l.user_id === req.user!.id)
-    .sort((a, b) => b.id - a.id)
-  const total = all.length
-  const items = all.slice((page - 1) * pageSize, page * pageSize).map((r) => ({
-    ...r,
-    amountYuan: centsToYuan(r.amount_cents),
-    balanceAfterYuan: centsToYuan(r.balance_after),
-  }))
+  const userId = req.user!.id
+  const total = db.countLedger({ userId })
+  const items = db
+    .queryLedger({ userId, limit: pageSize, offset: (page - 1) * pageSize })
+    .map((r) => ({
+      ...r,
+      amountYuan: centsToYuan(r.amount_cents),
+      balanceAfterYuan: centsToYuan(r.balance_after),
+    }))
   ok(res, { page, pageSize, total, items })
 })

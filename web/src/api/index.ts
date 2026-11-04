@@ -8,17 +8,36 @@ export type RuntimeStatus = {
   models: { slug: string; current: number; limit: number }[]
   endpoints: { name: string; current: number }[]
   keys: { id: string; current: number; limit: number }[]
-  defaults: { rpm: number; maxConcurrent: number }
+  defaults: { rpm: number; maxConcurrent: number; current: number }
   sampledAt?: string
   scope?: 'process'
 }
 
+export type CheckinStatus = {
+  checkedIn: boolean
+  dailyClaimed: boolean
+  peakClaimed: boolean
+  peakAvailable: boolean
+  dailyRewardYuan: number
+  peakRewardYuan: number
+}
+
+export type CheckinResult = CheckinStatus & {
+  already: boolean
+  granted: ('daily' | 'peak')[]
+  rewardYuan: number
+  balanceCents?: number
+  balanceYuan?: number
+  message?: string
+}
+
 export const api = {
-  loginUrl: () => http.get<{ authorize_url: string; state: string }>('api/auth/oauth/login-url'),
-  oauthToken: (code: string, state: string) =>
-    http.post<{ session_id: string }>('api/auth/oauth/token', { code, state }),
-  oauthUserinfo: (session_id: string) =>
-    http.post<{ token: string; user: User }>('api/auth/oauth/userinfo', { session_id }),
+  login: (email: string, password: string) =>
+    http.post<{ token: string; user: User }>('api/auth/login', { email, password }),
+  // 静默 SSO：带共享父域 Cookie 换本地会话，失败静默回落表单
+  ssoTry: () => http.post<{ token: string; user: User }>('api/auth/sso/try'),
+  // 单点登出：撤销 unisso 会话 + 清父域 Cookie
+  logout: () => http.post<{ ok: boolean }>('api/auth/logout'),
   me: () => http.get<User>('api/auth/me'),
 
   keys: () => http.get<any[]>('api/keys'),
@@ -58,16 +77,8 @@ export const api = {
   balance: () => http.get<any>('api/billing/balance'),
   billingSummary: () => http.get<any>('api/billing/summary'),
   ledger: (page = 1) => http.get<any>(`api/billing/ledger?page=${page}`),
-  checkinStatus: () => http.get<{ checkedIn: boolean; rewardYuan: number }>('api/billing/checkin'),
-  checkin: () =>
-    http.post<{
-      checkedIn: boolean
-      already: boolean
-      rewardYuan: number
-      balanceCents?: number
-      balanceYuan?: number
-      message?: string
-    }>('api/billing/checkin'),
+  checkinStatus: () => http.get<CheckinStatus>('api/billing/checkin'),
+  checkin: () => http.post<CheckinResult>('api/billing/checkin'),
 
   models: () => http.get<any[]>('api/models'),
   docs: () =>
