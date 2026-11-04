@@ -35,7 +35,8 @@ export const api = {
   login: (email: string, password: string) =>
     http.post<{ token: string; user: User }>('api/auth/login', { email, password }),
   // 静默 SSO：带共享父域 Cookie 换本地会话，失败静默回落表单
-  ssoTry: () => http.post<{ token: string; user: User }>('api/auth/sso/try'),
+  // 8s 超时：静默探测不能让路由守卫挂死首屏（实例默认 60s 太长）
+  ssoTry: () => http.post<{ token: string; user: User }>('api/auth/sso/try', undefined, { timeout: 8000 }),
   // 单点登出：撤销 unisso 会话 + 清父域 Cookie
   logout: () => http.post<{ ok: boolean }>('api/auth/logout'),
   me: () => http.get<User>('api/auth/me'),

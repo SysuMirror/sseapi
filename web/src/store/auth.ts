@@ -64,27 +64,37 @@ export type SsoCheck = 'ok' | 'invalid' | 'unavailable'
 let ssoCheck: Promise<SsoCheck> | null = null
 let ssoChecked = false
 
+async function probeSsoOnce(): Promise<{ state: SsoCheck; retryable: boolean }> {
+  try {
+    // 动态引入避免 store ↔ api 的循环依赖
+    const { api } = await import('../api')
+    const data = await api.ssoTry()
+    setAuth(data.token, data.user)
+    return { state: 'ok', retryable: false }
+  } catch (e) {
+    const status = (e as { status?: number }).status
+    if (status === 401) {
+      clearAuth()
+      return { state: 'invalid', retryable: false }
+    }
+    // 429 契约明确不自动重试；其余不可达类错误（超时/断连/5xx）允许重试一次
+    return { state: 'unavailable', retryable: status !== 429 }
+  }
+}
+
 export function revalidateSso(): Promise<SsoCheck> {
   if (ssoCheck) return ssoCheck
   if (ssoChecked) return Promise.resolve(isLoggedIn() ? 'ok' : 'invalid')
   ssoCheck = (async () => {
-    try {
-      // 动态引入避免 store ↔ api 的循环依赖
-      const { api } = await import('../api')
-      const data = await api.ssoTry()
-      setAuth(data.token, data.user)
-      return 'ok'
-    } catch (e) {
-      const status = (e as { status?: number }).status
-      if (status === 401) {
-        clearAuth()
-        return 'invalid'
-      }
-      return 'unavailable'
-    } finally {
-      ssoChecked = true
-      ssoCheck = null
+    let r = await probeSsoOnce()
+    if (r.state === 'unavailable' && r.retryable) {
+      // 冷启动首连偶发挂起/断连：短退避重试一次，不让用户被迫手动刷新
+      await new Promise((resolve) => setTimeout(resolve, 600))
+      r = await probeSsoOnce()
     }
+    ssoChecked = true
+    ssoCheck = null
+    return r.state
   })()
   return ssoCheck
 }
