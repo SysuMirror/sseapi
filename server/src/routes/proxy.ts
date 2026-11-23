@@ -27,6 +27,7 @@ import {
   anthropicMessagesUrl,
   responsesUrl,
 } from '../services/proxy-common.js'
+import { upstreamWatchdog } from '../services/upstream-guard.js'
 import {
   buildEmbeddingUpstreamRequest,
   normalizeEmbeddingToOpenAi,
@@ -333,17 +334,20 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
     payload.stream_options = { ...prev, include_usage: true }
   }
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查 vLLM 地址）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查上游地址）', type: 'upstream_error' },
     })
     return
   }
@@ -361,14 +365,21 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
     }
     const decoder = new TextDecoder()
     let buf = ''
+    // 响应头已到 → 改用“块间空闲超时”；每读到一块重置，正常长流不受影响
+    wd.armIdle()
     try {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        wd.armIdle()
         buf += decoder.decode(value, { stream: true })
         res.write(value)
       }
+    } catch (e) {
+      // 上游中途僵死/超时：结束响应（finally 再兜一次）→ 并发票随响应结束释放
+      console.warn('[proxy] 上游流式读取中断:', e instanceof Error ? e.message : String(e))
     } finally {
+      wd.stop()
       res.end()
     }
     let usage = extractUsageFromSse(buf)
@@ -401,7 +412,17 @@ proxyRouter.post('/chat/completions', authApiKey, async (req: AuthedRequest, res
     return
   }
 
-  const text = await upstreamRes.text()
+  wd.armBody()
+  let text: string
+  try {
+    text = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
+    res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+    return
+  }
+  wd.stop()
   let json: unknown = null
   try {
     json = JSON.parse(text)
@@ -485,22 +506,35 @@ proxyRouter.post('/embeddings', authApiKey, async (req: AuthedRequest, res) => {
   const url = `${base}${urlPath}`
   const inputCount = openAiInputToStrings(body.input).length
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查上游地址与协议）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查上游地址与协议）', type: 'upstream_error' },
     })
     return
   }
+  wd.armBody()
 
-  const rawText = await upstreamRes.text()
+  let rawText: string
+  try {
+    rawText = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
+    res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+    return
+  }
+  wd.stop()
   let upstreamJson: unknown = null
   try {
     upstreamJson = JSON.parse(rawText)
@@ -572,22 +606,35 @@ proxyRouter.post('/rerank', authApiKey, async (req: AuthedRequest, res) => {
   const query = String(body.query ?? '')
   const docCount = toDocumentStrings(body.documents).length
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查上游地址与协议）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查上游地址与协议）', type: 'upstream_error' },
     })
     return
   }
+  wd.armBody()
 
-  const rawText = await upstreamRes.text()
+  let rawText: string
+  try {
+    rawText = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
+    res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+    return
+  }
+  wd.stop()
   let upstreamJson: unknown = null
   try {
     upstreamJson = JSON.parse(rawText)
@@ -789,6 +836,7 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
     delete payloadProxy.api_key
     const wantStream = Boolean(body.stream)
 
+    const wd = upstreamWatchdog()
     let upstreamRes: globalThis.Response
     try {
       upstreamRes = await fetch(url, {
@@ -799,11 +847,13 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
           ...upstreamSessionHeaders(req),
         },
         body: JSON.stringify(payloadProxy),
+        signal: wd.signal,
       })
     } catch (e) {
+      wd.stop()
       await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
       res.status(502).json({
-        error: { message: '上游连接失败（请检查 Anthropic 地址）', type: 'upstream_error' },
+        error: { message: '上游连接失败或超时（请检查 Anthropic 地址）', type: 'upstream_error' },
       })
       return
     }
@@ -882,17 +932,22 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
         }
         if (final && curData) dispatch()
       }
+      wd.armIdle()
       try {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
+          wd.armIdle()
           buf += decoder.decode(value, { stream: true })
           flushSse()
         }
         buf += decoder.decode()
         flushSse(true)
         writeEvents(passthrough.finish())
+      } catch (e) {
+        console.warn('[proxy] 上游流式读取中断(messages):', e instanceof Error ? e.message : String(e))
       } finally {
+        wd.stop()
         res.end()
       }
       const usage = readUsage(extractUsageFromSse(buf))
@@ -915,7 +970,17 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
       return
     }
 
-    const text = await upstreamRes.text()
+    wd.armBody()
+    let text: string
+    try {
+      text = await upstreamRes.text()
+    } catch (e) {
+      wd.stop()
+      await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
+      res.status(504).json({ type: 'error', error: { type: 'api_error', message: '上游响应读取超时' } })
+      return
+    }
+    wd.stop()
     let json: unknown = null
     try {
       json = JSON.parse(text)
@@ -986,17 +1051,20 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
     payload.stream_options = { ...prev, include_usage: true }
   }
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查 vLLM 地址）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查 vLLM 地址）', type: 'upstream_error' },
     })
     return
   }
@@ -1071,6 +1139,7 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        wd.armIdle()
         buf += decoder.decode(value, { stream: true })
         // 按行拆 SSE data，取完整 JSON 块
         const lines = buf.split('\n')
@@ -1138,7 +1207,10 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
         // 少了它会把整段正文丢弃，只剩 thinking 块。
         writeEvents(claudeStreamEndEvents(contentStream, { input_tokens: inputTokens }))
       }
+    } catch (e) {
+      console.warn('[proxy] 上游流式读取中断(messages):', e instanceof Error ? e.message : String(e))
     } finally {
+      wd.stop()
       // 流式响应收尾：把本次 reasoning_content 记入缓存，供下一轮回传补挂。
       // 该字段对 DeepSeek 强校验、对其他 OpenAI 兼容上游静默忽略，故通用补挂是安全的；
       // 仅在 reasoning 非空时写缓存（避免空值污染非 DeepSeek 上游）。
@@ -1179,7 +1251,17 @@ proxyRouter.post('/messages', authApiKey, async (req: AuthedRequest, res) => {
   }
 
   // —— 非流式 ——
-  const text = await upstreamRes.text()
+  wd.armBody()
+  let text: string
+  try {
+    text = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
+    res.status(504).json({ type: 'error', error: { type: 'api_error', message: '上游响应读取超时' } })
+    return
+  }
+  wd.stop()
   let json: unknown = null
   try {
     json = JSON.parse(text)
@@ -1339,17 +1421,20 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     delete payloadProxy.api_key
     const wantStream = Boolean(body.stream)
 
+    const wd = upstreamWatchdog()
     let upstreamRes: globalThis.Response
     try {
       upstreamRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
         body: JSON.stringify(payloadProxy),
+        signal: wd.signal,
       })
     } catch (e) {
+      wd.stop()
       await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
       res.status(502).json({
-        error: { message: '上游连接失败（请检查 Responses 地址）', type: 'upstream_error' },
+        error: { message: '上游连接失败或超时（请检查 Responses 地址）', type: 'upstream_error' },
       })
       return
     }
@@ -1389,10 +1474,12 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
       let allText = ''
       let forwarded = false
       let upstreamErrorMsg: string | null = null
+      wd.armIdle()
       try {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
+          wd.armIdle()
           const chunk = decoder.decode(value, { stream: true })
           buf += chunk
           allText += chunk
@@ -1423,7 +1510,10 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
         } else if (buf) {
           res.write(buf)
         }
+      } catch (e) {
+        console.warn('[proxy] 上游流式读取中断(responses):', e instanceof Error ? e.message : String(e))
       } finally {
+        wd.stop()
         res.end()
       }
       const usage = readUsage(extractUsageFromSse(allText))
@@ -1450,7 +1540,17 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
       return
     }
 
-    const text = await upstreamRes.text()
+    wd.armBody()
+    let text: string
+    try {
+      text = await upstreamRes.text()
+    } catch (e) {
+      wd.stop()
+      await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
+      res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+      return
+    }
+    wd.stop()
     let json: unknown = null
     try {
       json = JSON.parse(text)
@@ -1521,17 +1621,20 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
     payload.stream_options = { ...prev, include_usage: true }
   }
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...upstreamAuthHeader(model), ...upstreamSessionHeaders(req) },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查 vLLM 地址）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查 vLLM 地址）', type: 'upstream_error' },
     })
     return
   }
@@ -1580,6 +1683,7 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
         graceTimer = setTimeout(() => resolve({ done: true, value: undefined, timedOut: true }), 3000)
       })
 
+    wd.armIdle()
     try {
       while (true) {
         const read = reader.read().then((r) => ({ ...r, timedOut: false }))
@@ -1590,6 +1694,7 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
         }
         const { done, value } = raced
         if (done) break
+        wd.armIdle()
         buf += decoder.decode(value, { stream: true })
         const lines = buf.split('\n')
         buf = lines.pop() || ''
@@ -1626,7 +1731,10 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
         if (builder.isTerminated) break
       }
       if (!builder.isTerminated) writeEvents(builder.finish())
+    } catch (e) {
+      console.warn('[proxy] 上游流式读取中断(responses):', e instanceof Error ? e.message : String(e))
     } finally {
+      wd.stop()
       if (graceTimer) clearTimeout(graceTimer)
       res.end()
     }
@@ -1659,7 +1767,17 @@ proxyRouter.post('/responses', authApiKey, async (req: AuthedRequest, res) => {
   }
 
   // —— 非流式 ——
-  const text = await upstreamRes.text()
+  wd.armBody()
+  let text: string
+  try {
+    text = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, imageCount, 'error', String(e))
+    res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+    return
+  }
+  wd.stop()
   let json: unknown = null
   try {
     json = JSON.parse(text)

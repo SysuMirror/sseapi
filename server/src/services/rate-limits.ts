@@ -26,6 +26,12 @@ type LimitCheck = {
 }
 
 const WINDOW_MS = 60_000
+
+/** 并发票最长持有时间（毫秒）：上游僵死时防止并发槽被永久占死（默认 30 分钟）。 */
+const CONC_MAX_HOLD_MS = (() => {
+  const v = Number(process.env.SSEAPI_CONC_MAX_HOLD_MS)
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 1_800_000
+})()
 const rpmBuckets = new Map<string, number[]>()
 const concurrentCounts = new Map<string, number>()
 
@@ -347,9 +353,14 @@ export function enforceRateLimits(req: AuthedRequest, res: Response, modelSlug?:
   for (const [map, key] of observed) map.set(key, (map.get(key) || 0) + 1)
 
   let released = false
+  let holdGuard: ReturnType<typeof setTimeout> | null = null
   const releaseAll = () => {
     if (released) return
     released = true
+    if (holdGuard) {
+      clearTimeout(holdGuard)
+      holdGuard = null
+    }
     res.off('close', releaseAll)
     res.off('finish', releaseAll)
     for (const c of acquiredConc) releaseConcurrent(c.concKey)
@@ -362,6 +373,19 @@ export function enforceRateLimits(req: AuthedRequest, res: Response, modelSlug?:
   }
   res.once('close', releaseAll)
   res.once('finish', releaseAll)
+
+  // 兜底闸门：并发票只在响应结束时释放；若上游僵死导致响应永不结束，
+  // 个别挂死请求会把 模型/用户/密钥 维度的并发槽永久占死 → 之后全体 429。
+  // 这里在 CONC_MAX_HOLD_MS 后强制释放（只放票、不动响应），保证不会永久泄漏。
+  if (acquiredConc.length || observed.length) {
+    holdGuard = setTimeout(() => {
+      console.warn(
+        `[ratelimit] 并发票持有超时兜底释放（${CONC_MAX_HOLD_MS}ms）model=${modelSlug || '-'} path=${req.originalUrl || req.url || '-'}`,
+      )
+      releaseAll()
+    }, CONC_MAX_HOLD_MS)
+    ;(holdGuard as { unref?: () => void }).unref?.()
+  }
 
   return true
 }
