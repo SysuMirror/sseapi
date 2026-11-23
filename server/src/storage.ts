@@ -1,5 +1,8 @@
 import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
+import zlib from 'node:zlib'
+import { promisify } from 'node:util'
 import {
   GetObjectCommand,
   HeadObjectCommand,
@@ -7,12 +10,27 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3'
 import { config } from './config.js'
+import { db } from './db.js'
+import { closeDb, dbPath, openDb, snapshotTo } from './sqlite.js'
+
+const gzip = promisify(zlib.gzip)
+const gunzip = promisify(zlib.gunzip)
+
+/**
+ * MinIO 备份层。
+ *
+ * SQLite 文件（~80MB）是唯一的事实来源，跑在持久盘上；
+ * MinIO 只放「异地快照」：VACUUM INTO 出一份一致的副本 → gzip → 上传。
+ *
+ * 旧实现是每次把 200MB+ 的历史整份重新 PUT，还带一次同步 readFileSync，
+ * 既是卡顿主因也是内存暴涨的来源；现在一次备份是几十 MB 且频率可调。
+ */
 
 /** 桶内对象键；与平台「同步历史数据」目录结构一致 */
 export const STORE_OBJECT_KEY = 'data/sseapi-store.json'
-export const HISTORY_OBJECT_KEYS = { usage_logs: 'data/history/usage_logs.jsonl', ledger: 'data/history/ledger.jsonl' } as const
+export const DB_OBJECT_KEY = 'data/sseapi.db.gz'
 
-const localPath = () => path.join(config.dataDir, 'sseapi-store.json')
+export type HistoryTable = 'usage_logs' | 'ledger'
 
 function env(key: string): string {
   return (process.env[key] ?? '').trim()
@@ -20,25 +38,21 @@ function env(key: string): string {
 
 export function isMinioConfigured(): boolean {
   return Boolean(
-    env('MINIO_ENDPOINT') &&
-      env('MINIO_ACCESS_KEY') &&
-      env('MINIO_SECRET') &&
-      env('MINIO_BUCKET'),
+    env('MINIO_ENDPOINT') && env('MINIO_ACCESS_KEY') && env('MINIO_SECRET') && env('MINIO_BUCKET'),
   )
 }
 
 export function storeBackendLabel(): string {
   if (!isMinioConfigured()) return 'local'
-  return `minio:${env('MINIO_BUCKET')}`
+  return `sqlite:${dbPath()} + minio:${env('MINIO_BUCKET')}`
 }
 
 let s3: S3Client | null = null
 
 function getS3(): S3Client {
   if (s3) return s3
-  const endpoint = env('MINIO_ENDPOINT')
   s3 = new S3Client({
-    endpoint,
+    endpoint: env('MINIO_ENDPOINT'),
     region: 'us-east-1',
     credentials: {
       accessKeyId: env('MINIO_ACCESS_KEY'),
@@ -53,151 +67,144 @@ function bucket(): string {
   return env('MINIO_BUCKET')
 }
 
-async function readFromMinio(): Promise<string | null> {
+function isNotFound(e: unknown): boolean {
+  const name = e && typeof e === 'object' && 'name' in e ? String(e.name) : ''
+  const code =
+    e && typeof e === 'object' && '$metadata' in e
+      ? (e as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
+      : undefined
+  return name === 'NoSuchKey' || name === 'NotFound' || code === 404
+}
+
+async function readObjectBytes(key: string): Promise<Buffer | null> {
   try {
-    const res = await getS3().send(
-      new GetObjectCommand({ Bucket: bucket(), Key: STORE_OBJECT_KEY }),
-    )
+    const res = await getS3().send(new GetObjectCommand({ Bucket: bucket(), Key: key }))
     if (!res.Body) return null
-    return await res.Body.transformToString('utf8')
-  } catch (e: unknown) {
-    const name = e && typeof e === 'object' && 'name' in e ? String(e.name) : ''
-    const code =
-      e && typeof e === 'object' && '$metadata' in e
-        ? (e as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
-        : undefined
-    if (name === 'NoSuchKey' || code === 404) return null
+    return Buffer.from(await res.Body.transformToByteArray())
+  } catch (e) {
+    if (isNotFound(e)) return null
     throw e
   }
 }
 
-async function existsInMinio(): Promise<boolean> {
-  try {
-    await getS3().send(new HeadObjectCommand({ Bucket: bucket(), Key: STORE_OBJECT_KEY }))
-    return true
-  } catch {
-    return false
-  }
-}
-
-function readLocal(): string | null {
-  const p = localPath()
-  if (!fs.existsSync(p)) return null
-  return fs.readFileSync(p, 'utf8')
-}
-
-function writeLocal(content: string): void {
-  fs.mkdirSync(config.dataDir, { recursive: true })
-  const p = localPath()
-  const tmp = `${p}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, content, 'utf8')
-  fs.renameSync(tmp, p)
-}
-
-async function writeMinio(content: string): Promise<void> {
+async function writeObject(key: string, body: Buffer | string, contentType: string): Promise<void> {
   await getS3().send(
-    new PutObjectCommand({
-      Bucket: bucket(),
-      Key: STORE_OBJECT_KEY,
-      Body: content,
-      ContentType: 'application/json; charset=utf-8',
-    }),
+    new PutObjectCommand({ Bucket: bucket(), Key: key, Body: body, ContentType: contentType }),
   )
 }
 
-export function localHistoryPath(table: keyof typeof HISTORY_OBJECT_KEYS): string { return path.join(config.dataDir, `${table}.jsonl`) }
-function uniqueHistory(rows: any[]): any[] {
-  return [...new Map(rows.map((row) => [row.id, row])).values()].sort((a, b) => a.id - b.id)
+// ── 冷启动还原 ──
+// 本地 db 不存在（新 Pod / 盘被清）时，从 MinIO 拉回最近一次快照。
+export async function restoreDbIfMissing(): Promise<boolean> {
+  const target = dbPath()
+  if (fs.existsSync(target)) return false
+  if (!isMinioConfigured()) return false
+  const packed = await readObjectBytes(DB_OBJECT_KEY)
+  if (!packed) return false
+  await fsp.mkdir(config.dataDir, { recursive: true })
+  const raw = await gunzip(packed)
+  await fsp.writeFile(target, raw)
+  console.log(`[sseapi] 已从 MinIO 还原数据库快照：${(raw.length / 1048576).toFixed(1)}MB`)
+  return true
 }
 
-// ── MinIO 同步去抖 ──
-// 之前每次 persist 都全量 PUT store + 全量读改写历史,大对象 PUT 反复超时(12s),
-// persist 队列堵塞导致内存堆积到 2GB OOM。本地文件才是持久化主路径,
-// MinIO 只是异地备份:本地写完立即返回,远端同步最多每 SYNC_MS 一次(尾沿触发)。
+// ── 备份 ──
+// 一次快照是几十 MB（gzip 后），这是异地灾备而不是主存储（主存储在持久盘上），
+// 所以按半小时一次：RPO 半小时，同时对共享 MinIO 的压力可控。
+const BACKUP_MS = Math.max(60_000, Number(process.env.SSEAPI_BACKUP_MS) || 30 * 60_000)
 const MINIO_SYNC_MS = Math.max(5_000, Number(process.env.SSEAPI_MINIO_SYNC_MS) || 30_000)
-const minioSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
-let minioSyncFailLogAt = 0
 
-function scheduleMinioSync(key: string, upload: () => Promise<void>): void {
+let backupTimer: ReturnType<typeof setTimeout> | null = null
+let backupRunning = false
+let backupFailLogAt = 0
+
+async function runBackup(): Promise<void> {
+  if (!isMinioConfigured() || backupRunning) return
+  backupRunning = true
+  const tmp = path.join(config.dataDir, `.backup-${process.pid}.db`)
+  try {
+    // 先把 WAL 合并回主库，避免它无限增长占盘（后台写入量大时尤其明显）
+    try {
+      openDb().pragma('wal_checkpoint(TRUNCATE)')
+    } catch {
+      /* 有并发读时 checkpoint 可能被跳过，下次再来 */
+    }
+    // VACUUM INTO 不阻塞读，产出的是整理过的单文件（不含 -wal/-shm）
+    fs.rmSync(tmp, { force: true })
+    snapshotTo(tmp)
+    const raw = await fsp.readFile(tmp)
+    const packed = await gzip(raw)
+    await writeObject(DB_OBJECT_KEY, packed, 'application/gzip')
+    // 兼容旧结构：store JSON 很小（约 50KB），顺带导出给平台的同步工具
+    await writeObject(STORE_OBJECT_KEY, JSON.stringify(exportLegacyStore()), 'application/json; charset=utf-8')
+    console.log(
+      `[sseapi] 备份完成：db ${(raw.length / 1048576).toFixed(1)}MB → gz ${(packed.length / 1048576).toFixed(1)}MB`,
+    )
+  } finally {
+    fs.rmSync(tmp, { force: true })
+    backupRunning = false
+  }
+}
+
+export function scheduleBackup(): void {
   if (!isMinioConfigured()) return
-  if (minioSyncTimers.has(key)) return // 已有待同步任务,尾沿定时器会带上最新内容
-  const timer = setTimeout(() => {
-    minioSyncTimers.delete(key)
-    upload().catch((e) => {
-      // 限流日志:每分钟最多一条,避免刷屏
-      if (Date.now() - minioSyncFailLogAt > 60_000) {
-        minioSyncFailLogAt = Date.now()
-        console.error('[sseapi] MinIO 同步失败(本地数据完好,稍后重试):', e instanceof Error ? e.message : e)
+  if (backupTimer) return
+  const t = setTimeout(() => {
+    backupTimer = null
+    runBackup().catch((e) => {
+      if (Date.now() - backupFailLogAt > 60_000) {
+        backupFailLogAt = Date.now()
+        console.error('[sseapi] MinIO 备份失败(本地数据完好,稍后重试):', e instanceof Error ? e.message : e)
       }
-      scheduleMinioSync(key, upload) // 失败后安排重试
+      scheduleBackup()
     })
   }, MINIO_SYNC_MS)
-  timer.unref?.()
-  minioSyncTimers.set(key, timer)
+  t.unref?.()
+  backupTimer = t
 }
 
-export async function appendHistory(table: keyof typeof HISTORY_OBJECT_KEYS, rows: unknown[]): Promise<void> {
-  if (!rows.length) return
-  // 纯追加:不再全量读取/合并/重写历史(旧实现 O(历史总量),是内存暴涨的主因)。
-  // 去重交给 readHistory(按 id),崩溃重放产生的重复行在读取时消解。
-  fs.mkdirSync(config.dataDir, { recursive: true })
-  fs.appendFileSync(localHistoryPath(table), rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
-  scheduleMinioSync(`history:${table}`, async () => {
-    const content = fs.readFileSync(localHistoryPath(table), 'utf8')
-    await withTimeout(writeMinioHistory(table, content), 30_000)
-  })
-}
-export async function readHistory(table: keyof typeof HISTORY_OBJECT_KEYS): Promise<any[]> {
-  const p = localHistoryPath(table)
-  const parse = (text: string): any[] => text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
-  const local = fs.existsSync(p) ? parse(fs.readFileSync(p, 'utf8')) : []
-  let remote: any[] = []
-  if (isMinioConfigured()) {
-    try { const result = await getS3().send(new GetObjectCommand({ Bucket: bucket(), Key: HISTORY_OBJECT_KEYS[table] })); if (result.Body) remote = parse(await result.Body.transformToString('utf8')) }
-    catch (error: any) { if (error?.name !== 'NoSuchKey' && error?.$metadata?.httpStatusCode !== 404) throw error }
-  }
-  return uniqueHistory([...remote, ...local])
-}
-async function writeMinioHistory(table: keyof typeof HISTORY_OBJECT_KEYS, content: string): Promise<void> { await getS3().send(new PutObjectCommand({Bucket: bucket(), Key: HISTORY_OBJECT_KEYS[table], Body: content, ContentType: 'application/x-ndjson'})) }
-
-/** 启动时加载：MinIO 为主；本地 PVC 为备份/冷启动种子 */
-export async function loadStoreRaw(): Promise<string | null> {
-  fs.mkdirSync(config.dataDir, { recursive: true })
-
-  if (isMinioConfigured()) {
-    const remote = await readFromMinio()
-    if (remote != null) {
-      writeLocal(remote)
-      return remote
-    }
-    const local = readLocal()
-    if (local != null) {
-      await writeMinio(local)
-      console.log(`[sseapi] 已将本地备份上传到桶: ${STORE_OBJECT_KEY}`)
-      return local
-    }
-    return null
-  }
-
-  return readLocal()
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) => {
-      const t = setTimeout(() => reject(new Error('MinIO 写入超时')), ms)
-      t.unref?.()
-    }),
-  ])
-}
-
-/** 持久化：先写本地（同步、即时），MinIO 去抖异步备份 */
-export async function saveStoreRaw(content: string): Promise<void> {
-  writeLocal(content)
+/** 定时备份（默认 15 分钟） */
+export function startBackupLoop(): void {
   if (!isMinioConfigured()) return
-  scheduleMinioSync('store', async () => {
-    // 上传时重读本地文件,拿到的是最新内容(去抖合并了多次保存)
-    await withTimeout(writeMinio(fs.readFileSync(localPath(), 'utf8')), 30_000)
-  })
+  const tick = () => {
+    runBackup().catch((e) => {
+      console.error('[sseapi] 定时备份失败:', e instanceof Error ? e.message : e)
+    })
+  }
+  const t = setInterval(tick, BACKUP_MS)
+  t.unref?.()
+  // 首启延迟一次，避免和冷启动抢 IO
+  const first = setTimeout(tick, Math.min(BACKUP_MS, 60_000))
+  first.unref?.()
 }
+
+/** 优雅退出：落盘 WAL + 立刻做一次备份 */
+export async function shutdown(): Promise<void> {
+  try {
+    closeDb()
+  } catch {
+    /* ignore */
+  }
+  if (!isMinioConfigured()) return
+  try {
+    await runBackup()
+  } catch {
+    /* 退出路径不再报错 */
+  }
+}
+
+/** 旧结构的 store JSON（仅配置类小表，不含明细） */
+function exportLegacyStore(): Record<string, unknown> {
+  const s = db.getStore()
+  return {
+    seq: s.seq,
+    users: s.users,
+    api_keys: s.api_keys,
+    models: s.models,
+    docs: s.docs,
+    oauth_states: s.oauth_states,
+    rate_limits: s.rate_limits,
+  }
+}
+
+export { openDb }

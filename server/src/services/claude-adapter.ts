@@ -737,27 +737,42 @@ export function openAiStreamChunkToClaude(
       stopReason = 'tool_use'
     }
 
-    if (contentStream) {
-      // 关闭仍打开的文本块（若有 DSML/artifact，块早已 stop）
-      events.push(...contentStream.close())
-    } else {
-      events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } })
-    }
-    events.push({
-      event: 'message_delta',
-      data: {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: usageHint
-          ? { input_tokens: Number(usageHint.input_tokens ?? 0), output_tokens: Number(usageHint.output_tokens ?? 0) }
-          : { output_tokens: 0 },
-      },
-    })
-    events.push({ event: 'message_stop', data: { type: 'message_stop' } })
+    // 关闭仍打开的文本块（若有 DSML/artifact，块早已 stop）
+    events.push(...claudeStreamEndEvents(contentStream, usageHint, stopReason))
     return { events, done: true }
   }
 
   return { events, done: false }
+}
+
+/**
+ * 结束一次 Claude 流：冲刷内容块 + message_delta + message_stop。
+ *
+ * 调用方必须保证只调用一次（`finish_reason` 分支与 `finally` 兜底二选一）：
+ * 上游若在流末尾没给 `finish_reason`，旧实现就永远不发 message_stop，
+ * Claude Code 这类「以 message_stop 收尾」的客户端会把已经流出来的正文丢掉，
+ * 只剩前面那个 thinking 块 —— 即「有 thinking 无内容」。
+ */
+export function claudeStreamEndEvents(
+  contentStream: ClaudeContentStream | undefined,
+  usageHint?: { input_tokens?: number; output_tokens?: number },
+  stopReason = 'end_turn',
+): Array<{ event: string; data: Record<string, unknown> }> {
+  const events: Array<{ event: string; data: Record<string, unknown> }> = contentStream
+    ? contentStream.close()
+    : [{ event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } }]
+  events.push({
+    event: 'message_delta',
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: usageHint
+        ? { input_tokens: Number(usageHint.input_tokens ?? 0), output_tokens: Number(usageHint.output_tokens ?? 0) }
+        : { output_tokens: 0 },
+    },
+  })
+  events.push({ event: 'message_stop', data: { type: 'message_stop' } })
+  return events
 }
 
 /** 统计 Claude messages 中的图片张数（OpenAI 兼容 content parts） */
@@ -977,6 +992,7 @@ function parseArtifact(raw: string, idx: number): EmittedEvent[] {
  */
 export class ClaudeContentStream {
   private buf = ''
+  private closed = false
   private nextIndex = 0
   /** 是否有「文本块」正处于打开（已 start、未 stop）状态 */
   private textOpen = false
@@ -1102,9 +1118,29 @@ export class ClaudeContentStream {
     return events
   }
 
-  /** 冲刷：关闭仍打开的文本块 + 收尾未结束的 tool_call 块 + 清空 buffer */
+  /**
+   * 冲刷：关闭仍打开的文本块 + 收尾未结束的 tool_call 块。
+   * 幂等（`finally` 与 `finish_reason` 两条路径都可能调用）。
+   */
   close(): EmittedEvent[] {
     const events: EmittedEvent[] = []
+    if (this.closed) return events
+    this.closed = true
+
+    // 再尝试一次结构化解析（最后一块可能刚好凑齐闭合标签）
+    events.push(...this.drain())
+
+    // 仍留在缓冲区的内容不能丢：drain() 只在「等待结构标签闭合」时才保留缓冲，
+    // 旧实现在这里直接 buf = ''，于是一个始终没闭合的 antArtifact / DSML
+    // 会把后面所有正文一起吞掉——表现就是「有 thinking、没内容」。
+    if (this.buf) {
+      const residual = this.buf
+      this.buf = ''
+      // 例外：未闭合的 DSML 工具调用是模型中途放弃，其块已 stop，丢弃以免把
+      // 半截 JSON 当正文吐给客户端；其余（未闭合 artifact / 普通文本）按文本输出。
+      if (findDsmlStart(residual) !== 0) events.push(...this.emitText(residual))
+    }
+
     if (this.textOpen) {
       events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: this.textIndex } })
       this.textOpen = false
@@ -1115,7 +1151,6 @@ export class ClaudeContentStream {
       events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: st.blockIndex } })
     }
     this.openToolCalls.clear()
-    this.buf = ''
     return events
   }
 

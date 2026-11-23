@@ -1,7 +1,14 @@
 <template>
   <div>
-    <h1 class="page-title">概览</h1>
-    <p class="page-sub">账户余额、近期用量与快捷入口。</p>
+    <section class="hero">
+      <div class="hero-text">
+        <h1 class="page-title">概览</h1>
+        <p class="page-sub">账户余额、近期用量与快捷入口。</p>
+      </div>
+      <div class="hero-orb" aria-hidden="true">
+        <OrbCanvas :size="200" :points="84" :speed="1.15" rgb="51,112,255" />
+      </div>
+    </section>
 
     <div class="stats">
       <div class="card stat">
@@ -22,26 +29,50 @@
       </div>
     </div>
 
-    <div class="checkin-card" :class="{ done: checkinDone }">
+    <!-- 签到已并入首页：不再单独成页，进来就能领 -->
+    <section class="card checkin" :class="{ claimed: allClaimed }">
       <div class="checkin-info">
-        <div class="checkin-icon">{{ checkinDone ? '✓' : '🎁' }}</div>
-        <div>
-          <div class="checkin-title">{{ checkinDone ? '今日已签到' : '每日签到' }}</div>
+        <span class="checkin-icon" aria-hidden="true">🎁</span>
+        <div class="checkin-text">
+          <div class="checkin-title">每日签到</div>
           <div class="checkin-desc">
-            {{ checkinDone ? '明天再来吧～' : '签到领取 ¥10 余额，每天一次' }}
+            每日 ¥{{ status?.dailyRewardYuan ?? 5 }}；北京时间 06:30–08:30 另加 ¥{{
+              status?.peakRewardYuan ?? 5
+            }} 雪峰奖励
           </div>
         </div>
       </div>
+
+      <div class="grants">
+        <div class="grant">
+          <span class="grant-label">每日奖励</span>
+          <span class="grant-state" :class="{ ok: status?.dailyClaimed }">
+            {{ status?.dailyClaimed ? '已领取' : '待领取' }}
+          </span>
+        </div>
+        <div class="grant">
+          <span class="grant-label">雪峰奖励</span>
+          <span
+            class="grant-state"
+            :class="{ ok: status?.peakClaimed, idle: !status?.peakAvailable && !status?.peakClaimed }"
+          >
+            {{ status?.peakClaimed ? '已领取' : status?.peakAvailable ? '待领取' : '窗口外' }}
+          </span>
+        </div>
+      </div>
+
       <button
-        class="btn checkin-btn"
-        :disabled="checkinDone || checkinLoading"
-        @click="doCheckin"
+        class="btn btn-primary checkin-btn"
+        type="button"
+        :disabled="loading || allClaimed"
+        @click="claim"
       >
-        <span v-if="checkinLoading">签到中…</span>
-        <span v-else-if="checkinDone">已签到</span>
-        <span v-else>签到 +¥10</span>
+        {{ loading ? '领取中…' : allClaimed ? '今日已领取' : '领取奖励' }}
       </button>
-    </div>
+
+      <p v-if="message" class="checkin-msg ok" role="status">{{ message }}</p>
+      <p v-if="checkinError" class="checkin-msg err" role="alert">{{ checkinError }}</p>
+    </section>
 
     <div class="grid">
       <div class="card panel">
@@ -81,14 +112,49 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { api } from '../api'
+import { api, type CheckinStatus } from '../api'
 import { patchUser } from '../store/auth'
 import { openDocs } from '../store/docs'
+import OrbCanvas from '../components/OrbCanvas.vue'
 
 const days = ref(30)
 const summary = ref<any>(null)
-const checkinDone = ref(false)
-const checkinLoading = ref(false)
+
+// —— 签到（原 /checkin 页面，已并入首页）——
+const status = ref<CheckinStatus | null>(null)
+const loading = ref(false)
+const message = ref('')
+const checkinError = ref('')
+
+const allClaimed = computed(
+  () => !!status.value?.dailyClaimed && (!status.value?.peakAvailable || !!status.value?.peakClaimed),
+)
+
+async function loadCheckin() {
+  try {
+    status.value = await api.checkinStatus()
+  } catch (e) {
+    checkinError.value = e instanceof Error ? e.message : '无法获取签到状态'
+  }
+}
+
+async function claim() {
+  loading.value = true
+  message.value = ''
+  checkinError.value = ''
+  try {
+    const r = await api.checkin()
+    status.value = r
+    if (r.balanceCents != null) patchUser({ balanceCents: r.balanceCents })
+    message.value = r.granted?.length
+      ? `奖励已到账 ¥${r.rewardYuan ?? 0}`
+      : r.message || '今日可领取的奖励已领取'
+  } catch (e) {
+    checkinError.value = e instanceof Error ? e.message : '领取失败，请稍后重试'
+  } finally {
+    loading.value = false
+  }
+}
 
 const bars = computed(() => {
   const list = summary.value?.byDay || []
@@ -110,63 +176,88 @@ async function load() {
   if (summary.value?.balanceCents != null) {
     patchUser({ balanceCents: summary.value.balanceCents })
   }
-  try {
-    const st = await api.checkinStatus()
-    checkinDone.value = st.checkedIn
-  } catch {
-    /* ignore */
-  }
 }
 
-async function doCheckin() {
-  if (checkinDone.value || checkinLoading.value) return
-  checkinLoading.value = true
-  try {
-    const r = await api.checkin()
-    checkinDone.value = true
-    if (r.balanceCents != null) {
-      patchUser({ balanceCents: r.balanceCents })
-      if (summary.value) summary.value.balanceCents = r.balanceCents
-    }
-  } catch {
-    /* ignore - toast handled by http layer */
-  } finally {
-    checkinLoading.value = false
-  }
-}
-
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadCheckin()
+})
 </script>
 
 <style scoped>
+/* —— 顶部 Hero：标题 + 运行状态 + 旋转节点球 —— */
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-6);
+}
+.hero-text {
+  min-width: 0;
+}
+.hero .page-title {
+  margin-bottom: 6px;
+}
+.hero .page-sub {
+  margin-bottom: 0;
+}
+.hero-orb {
+  flex-shrink: 0;
+  animation: fade-in 1s var(--ease) both;
+}
+@media (max-width: 900px) {
+  .hero {
+    grid-template-columns: 1fr;
+  }
+  .hero-orb {
+    display: none;
+  }
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: var(--sp-4);
   margin-bottom: var(--sp-4);
 }
-.checkin-card {
-  display: flex;
+/* —— 签到（并入首页）—— */
+.checkin {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) auto auto;
   align-items: center;
-  justify-content: space-between;
-  padding: var(--sp-4) var(--sp-5);
+  gap: var(--sp-5);
+  padding: var(--sp-5);
   margin-bottom: var(--sp-4);
-  border-radius: var(--radius);
-  border: 1px solid var(--line);
-  background: linear-gradient(135deg, #f0f5ff 0%, #faf0ff 100%);
-  gap: var(--sp-4);
+  background-image: linear-gradient(120deg, rgba(var(--brand-rgb), 0.07), rgba(124, 92, 214, 0.06));
+  overflow: hidden;
 }
-.checkin-card.done {
-  background: var(--n-50);
+/* 成功领取后整卡泛起一圈绿光 */
+.checkin.claimed {
+  background-image: linear-gradient(120deg, rgba(18, 161, 80, 0.08), rgba(var(--brand-rgb), 0.05));
+}
+.checkin.claimed::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 0 1px rgba(18, 161, 80, 0.28);
+  pointer-events: none;
 }
 .checkin-info {
   display: flex;
   align-items: center;
   gap: 14px;
+  min-width: 0;
 }
 .checkin-icon {
-  font-size: 28px;
+  font-size: 30px;
   line-height: 1;
+  flex-shrink: 0;
+  animation: float-y 5s var(--ease) infinite;
+}
+.checkin-text {
+  min-width: 0;
 }
 .checkin-title {
   font-size: var(--fs-lg);
@@ -176,18 +267,80 @@ onMounted(load)
 .checkin-desc {
   font-size: var(--fs-sm);
   color: var(--ink-soft);
-  margin-top: 2px;
+  margin-top: 3px;
+  line-height: 1.5;
+}
+.grants {
+  display: flex;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.grant {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  min-width: 96px;
+}
+.grant-label {
+  font-size: var(--fs-xs);
+  color: var(--ink-faint);
+  letter-spacing: 0.02em;
+}
+.grant-state {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.grant-state.ok {
+  color: var(--ok);
+}
+.grant-state.idle {
+  color: var(--ink-faint);
+  font-weight: 500;
 }
 .checkin-btn {
   white-space: nowrap;
   flex-shrink: 0;
 }
-.checkin-btn:disabled {
-  opacity: 0.55;
-  cursor: default;
+.checkin-msg {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: var(--fs-base);
+}
+.checkin-msg.ok {
+  color: var(--ok-ink);
+}
+.checkin-msg.err {
+  color: var(--danger-ink);
+}
+@media (max-width: 900px) {
+  .checkin {
+    grid-template-columns: 1fr;
+    gap: var(--sp-4);
+  }
+  .checkin-btn {
+    width: 100%;
+  }
 }
 .stat {
   padding: var(--sp-5);
+  background-image: radial-gradient(
+    120% 90% at 100% 0%,
+    rgba(var(--brand-rgb), 0.07),
+    transparent 62%
+  );
+  transition:
+    transform var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+.stat:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
 }
 .stat::after {
   content: '';
@@ -199,15 +352,30 @@ onMounted(load)
   border-radius: 0 3px 3px 0;
   background: var(--brand);
   opacity: 0.85;
+  box-shadow: 0 0 10px rgba(var(--brand-rgb), 0.55);
+}
+/* 顶部渐变高光条 */
+.stat::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(var(--brand-rgb), 0.55), transparent);
+  opacity: 0.7;
 }
 .stat:nth-child(2)::after {
   background: var(--violet);
+  box-shadow: 0 0 10px rgba(124, 92, 214, 0.55);
 }
 .stat:nth-child(3)::after {
   background: var(--ok);
+  box-shadow: 0 0 10px rgba(18, 161, 80, 0.5);
 }
 .stat:nth-child(4)::after {
   background: var(--warn);
+  box-shadow: 0 0 10px rgba(224, 128, 0, 0.5);
 }
 .label {
   font-size: var(--fs-sm);

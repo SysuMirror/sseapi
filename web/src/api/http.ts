@@ -13,9 +13,16 @@ function resolveBase(): string {
   return raw.endsWith('/') ? raw : `${raw}/`
 }
 
+/** 给裸 fetch 用的 API 根地址（SSE 流式走 fetch，不走 axios 拦截器） */
+export function apiBaseUrl(): string {
+  return resolveBase()
+}
+
 const instance: AxiosInstance = axios.create({
   baseURL: resolveBase(),
   timeout: 60000,
+  // 跨域（platform→api.ssemarket.cn）也要收发 .ssemarket.cn 的 SSO Cookie
+  withCredentials: true,
 })
 
 instance.interceptors.request.use((config) => {
@@ -38,14 +45,20 @@ instance.interceptors.response.use(
     const status = error.response?.status
     const body = error.response?.data
     const message = body?.message || error.message || '网络错误'
-    if (status === 401) {
+    // 认证端点自身的 401（密码错误、无 SSO 会话）由调用方处理，
+    // 不能触发「清会话 + 跳登录」，否则登录页/静默登录会被强制刷新。
+    const isAuthCall = String(error.config?.url || '').includes('/auth/')
+    if (status === 401 && !isAuthCall) {
       clearAuth()
       const loginPath = `${import.meta.env.BASE_URL}login`.replace(/\/{2,}/g, '/')
       if (!window.location.pathname.endsWith('/login')) {
         window.location.replace(loginPath)
       }
     }
-    return Promise.reject(new Error(message))
+    // 保留 HTTP 状态码：调用方（静默 SSO 复核）据此区分 401 失效与 503 不可达
+    const err = new Error(message) as Error & { status?: number }
+    err.status = status
+    return Promise.reject(err)
   },
 )
 

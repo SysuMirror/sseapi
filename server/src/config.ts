@@ -1,5 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { loadEnvFile } from './load-env.js'
+
+// 必须在读取任何 env 之前执行。
+// index.ts 里那句 loadEnvFile() 其实来不及：ESM 的 import 会先于模块体求值，
+// config.ts 早就把 JWT_SECRET 等读完了（线上靠 deploy.sh 先 source server/.env 才没暴露）。
+loadEnvFile()
 
 function env(key: string, fallback = ''): string {
   return (process.env[key] ?? fallback).trim()
@@ -22,6 +28,9 @@ function resolveApiPublicBase(): string {
 const dataDir = env('DATA_DIR') || env('SDPY_DATA_DIR') || path.join(process.cwd(), 'data')
 fs.mkdirSync(dataDir, { recursive: true })
 
+// 集市内置平台管理员（user_id 327）在 UniSSO 的 sub
+const BUILTIN_ADMIN_SUB = '5dba4932-eb5a-4f80-8ff6-dcf1f1a460a5'
+
 export const config = {
   port: Number(env('PORT', '8080')),
   dataDir,
@@ -31,26 +40,22 @@ export const config = {
   publicBase: resolveApiPublicBase(),
   apiPublicBase: resolveApiPublicBase(),
   frontendDist: env('SSEAPI_FRONTEND_DIST') || path.join(process.cwd(), '../web/dist'),
-  platformAdminOauthIds: new Set(
+  /** 平台管理员白名单：UniSSO sub（sub 为登录主键） */
+  platformAdminSubs: new Set(
     [
-      '327', // 内置平台管理员（集市 user_id）
-      ...env('PLATFORM_ADMIN_OAUTH_IDS')
+      BUILTIN_ADMIN_SUB,
+      ...env('PLATFORM_ADMIN_UNISSO_SUBS')
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
     ],
   ),
+  // UniSSO 机器对机器密码校验（无 OAuth 跳转）：
+  // POST {issuer}/api/oauth/password/verify，form: email/password/client_id/client_secret
   oauth: {
-    baseUrl: env('SSEAPI_OAUTH_BASE_URL', 'https://ssemarket.cn/new'),
-    apiBaseUrl:
-      env('SSEAPI_OAUTH_API_BASE_URL') ||
-      env('SSEAPI_OAUTH_BASE_URL', 'https://ssemarket.cn/new').replace(/\/new\/?$/, '') ||
-      'https://ssemarket.cn',
-    appId: env('SSEAPI_OAUTH_APP_ID') || env('OAUTH_APP_ID'),
-    appSecret: env('SSEAPI_OAUTH_APP_SECRET') || env('OAUTH_APP_SECRET'),
-    redirectUri: env('SSEAPI_OAUTH_REDIRECT_URI') || env('OAUTH_REDIRECT_URI'),
-    authorizePath: env('SSEAPI_OAUTH_AUTHORIZE_PATH', '/connect'),
-    scope: env('SSEAPI_OAUTH_SCOPE', 'read_basic'),
+    issuer: env('UNISSO_ISSUER', 'https://sso.ssemarket.cn').replace(/\/$/, ''),
+    clientId: env('UNISSO_CLIENT_ID'),
+    clientSecret: env('UNISSO_CLIENT_SECRET'),
   },
 
   /**
@@ -66,5 +71,5 @@ export const config = {
 }
 
 export function isOAuthConfigured(): boolean {
-  return Boolean(config.oauth.appId && config.oauth.appSecret && config.oauth.redirectUri)
+  return Boolean(config.oauth.issuer && config.oauth.clientId && config.oauth.clientSecret)
 }

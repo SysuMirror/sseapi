@@ -27,23 +27,19 @@ unset NODE_ENV || true
 export PUBLIC_BASE="${PUBLIC_BASE:-${SDPY_PUBLIC_URL:-https://platform.ssemarket.cn}}"
 export SSEAPI_API_PUBLIC_URL="${SSEAPI_API_PUBLIC_URL:-${SDPY_API_PUBLIC_URL:-https://api.ssemarket.cn}}"
 export SSEAPI_CORS_ORIGINS="${SSEAPI_CORS_ORIGINS:-https://platform.ssemarket.cn,https://platform.ssemarket.cn/}"
-export PLATFORM_ADMIN_OAUTH_IDS="${PLATFORM_ADMIN_OAUTH_IDS:-327}"
 export JWT_SECRET="${JWT_SECRET:-change-me}"
 
-# 集市 OAuth（与 oauth2_apps.app_id=sseapi 对齐；模块 env 可覆盖）
-export SSEAPI_OAUTH_BASE_URL="${SSEAPI_OAUTH_BASE_URL:-https://ssemarket.cn/new}"
-export SSEAPI_OAUTH_API_BASE_URL="${SSEAPI_OAUTH_API_BASE_URL:-https://ssemarket.cn}"
-export SSEAPI_OAUTH_APP_ID="${SSEAPI_OAUTH_APP_ID:-${OAUTH_APP_ID:-sseapi}}"
-export SSEAPI_OAUTH_APP_SECRET="${SSEAPI_OAUTH_APP_SECRET:-${OAUTH_APP_SECRET:-change-me}}"
-export SSEAPI_OAUTH_REDIRECT_URI="${SSEAPI_OAUTH_REDIRECT_URI:-${OAUTH_REDIRECT_URI:-https://platform.ssemarket.cn/oauth/callback}}"
-export SSEAPI_OAUTH_AUTHORIZE_PATH="${SSEAPI_OAUTH_AUTHORIZE_PATH:-/connect}"
-export SSEAPI_OAUTH_SCOPE="${SSEAPI_OAUTH_SCOPE:-read_basic}"
+# UniSSO 机器对机器密码校验（无 OAuth 跳转；模块 env 可覆盖）
+export UNISSO_ISSUER="${UNISSO_ISSUER:-https://sso.ssemarket.cn}"
+export UNISSO_CLIENT_ID="${UNISSO_CLIENT_ID:-app_d12284c26f111821}"
+export UNISSO_CLIENT_SECRET="${UNISSO_CLIENT_SECRET:-}"
+export PLATFORM_ADMIN_UNISSO_SUBS="${PLATFORM_ADMIN_UNISSO_SUBS:-5dba4932-eb5a-4f80-8ff6-dcf1f1a460a5}"
 
 echo "[deploy] PORT=$PORT DATA_DIR=$DATA_DIR"
 echo "[deploy] PUBLIC_BASE=$PUBLIC_BASE (console)"
 echo "[deploy] SSEAPI_API_PUBLIC_URL=$SSEAPI_API_PUBLIC_URL (OpenAI /v1)"
 echo "[deploy] SDPY_API_PUBLIC_URL=${SDPY_API_PUBLIC_URL:-}"
-echo "[deploy] OAuth app_id=$SSEAPI_OAUTH_APP_ID redirect=$SSEAPI_OAUTH_REDIRECT_URI"
+echo "[deploy] UniSSO issuer=$UNISSO_ISSUER client=$UNISSO_CLIENT_ID (password verify)"
 if [ -n "${MINIO_ENDPOINT:-}" ] && [ -n "${MINIO_BUCKET:-}" ]; then
   echo "[deploy] store=minio:${MINIO_BUCKET} (local backup under DATA_DIR)"
 else
@@ -53,9 +49,31 @@ fi
 # 若包内有 server/.env，补缺（不覆盖已 export / 平台注入的键）
 if [ -f "$ROOT/server/.env" ]; then
   set -a
-  source <(tr -d "" < "$ROOT/server/.env") || true
+  source <(tr -d '\r' < "$ROOT/server/.env") || true
   set +a
 fi
+# 依赖是否已就绪且与 package-lock.json 一致。
+# better-sqlite3 是原生模块，本机没有预编译包，每次 npm ci 都要现场编译（约 1.5 分钟）
+# 且依赖 g++/make/python3。重启窗口里这是最大的不确定性来源，
+# 所以 lock 没变、且原生模块真能 require 成功时，直接复用现成的 node_modules。
+deps_ready() {
+  [ -d node_modules ] || return 1
+  [ -f node_modules/.deps-stamp ] || return 1
+  [ -f package-lock.json ] || return 1
+  local want have
+  want="$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)"
+  have="$(cat node_modules/.deps-stamp 2>/dev/null)"
+  [ -n "$want" ] && [ "$want" = "$have" ] || return 1
+  # 指纹对得上还不够，原生模块必须真的能加载（ABI 变了会在这里暴露）
+  node -e "require('better-sqlite3')" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+stamp_deps() {
+  [ -f package-lock.json ] || return 0
+  sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1 > node_modules/.deps-stamp || true
+}
+
 npm_ci_or_install() {
   # 自愈:清掉上次 npm 中断留下的 rename 临时目录(.esbuild-XXXX 等),
   # 否则 npm ci 报 ENOTEMPTY 反复崩溃,supervisord 重试耗尽后 FATAL(502 根因)
@@ -70,6 +88,7 @@ npm_ci_or_install() {
   else
     npm install --include=dev
   fi
+  stamp_deps
 }
 
 # —— server ——
@@ -81,10 +100,15 @@ if [ -f server/package.json ]; then
     npm run build
     cd "$ROOT"
   else
-    echo "[deploy] server/dist 已存在，跳过 tsc；仅安装生产依赖"
+    echo "[deploy] server/dist 已存在，跳过 tsc；检查生产依赖"
     cd server
-    find node_modules -maxdepth 1 -name '.*-*' -type d -exec rm -rf {} + 2>/dev/null || true
-    npm ci --omit=dev 2>/dev/null || { rm -rf node_modules; npm ci --omit=dev 2>/dev/null; } || npm install --omit=dev
+    if deps_ready; then
+      echo "[deploy] server node_modules 已就绪且与 lock 一致，跳过 npm ci（省下原生模块编译）"
+    else
+      find node_modules -maxdepth 1 -name '.*-*' -type d -exec rm -rf {} + 2>/dev/null || true
+      npm ci --omit=dev 2>/dev/null || { rm -rf node_modules; npm ci --omit=dev 2>/dev/null; } || npm install --omit=dev
+      stamp_deps
+    fi
     cd "$ROOT"
   fi
   if [ ! -f server/dist/index.js ]; then

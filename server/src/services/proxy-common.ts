@@ -12,6 +12,7 @@ import {
   type ModelType,
 } from '../services/model-catalog.js'
 import { mayAccessDevOnly } from '../services/dev-platform.js'
+import { upstreamWatchdog } from '../services/upstream-guard.js'
 
 export function upstreamAuthHeader(model: ModelRow): Record<string, string> {
   const key = (model.upstream_api_key || process.env.SSEAPI_UPSTREAM_API_KEY || '').trim()
@@ -238,7 +239,8 @@ export async function appendUsage(
     Math.max(0, Math.floor(promptTokens || 0)),
     Math.max(0, Math.floor(cachedTokens || 0)),
   )
-  db.getStore().usage_logs.push({
+  // 直接落库：用量明细是无限增长的事件表，不再进内存
+  db.insertUsageLog({
     id: db.nextId('usage_logs'),
     user_id: req.user!.id,
     api_key_id: req.apiKeyId ?? null,
@@ -255,6 +257,7 @@ export async function appendUsage(
     prompt: prompt || promptPreview(req),
     created_at: now(),
   })
+  // 余额等小表可能在同一请求里被改过，统一写回
   await db.persist()
 }
 
@@ -422,6 +425,7 @@ export async function forwardJsonProxy(
   const payload: Record<string, unknown> = { ...body, model: upstreamModel }
   delete payload.api_key
 
+  const wd = upstreamWatchdog()
   let upstreamRes: globalThis.Response
   try {
     upstreamRes = await fetch(url, {
@@ -432,16 +436,29 @@ export async function forwardJsonProxy(
         ...upstreamSessionHeaders(req),
       },
       body: JSON.stringify(payload),
+      signal: wd.signal,
     })
   } catch (e) {
+    wd.stop()
     await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
     res.status(502).json({
-      error: { message: '上游连接失败（请检查上游地址）', type: 'upstream_error' },
+      error: { message: '上游连接失败或超时（请检查上游地址）', type: 'upstream_error' },
     })
     return
   }
+  // 响应头已到：切到非流式“整体读取”超时，防止 body 阶段僵死
+  wd.armBody()
 
-  const text = await upstreamRes.text()
+  let text: string
+  try {
+    text = await upstreamRes.text()
+  } catch (e) {
+    wd.stop()
+    await appendUsage(req, modelSlug, 0, 0, 0, 0, 0, 'error', String(e))
+    res.status(504).json({ error: { message: '上游响应读取超时', type: 'upstream_timeout' } })
+    return
+  }
+  wd.stop()
   let json: unknown = null
   try {
     json = JSON.parse(text)

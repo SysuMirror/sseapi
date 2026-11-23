@@ -4,22 +4,40 @@ import { db, now, type UserRow } from '../db.js'
 export type { UserRow }
 
 export async function upsertUserFromOAuth(profile: {
-  user_id: number | string
+  sub: string
+  sseSub: string
   name: string
   email?: string
   avatar_url?: string
 }): Promise<UserRow> {
-  const oauthId = String(profile.user_id)
+  const sub = profile.sub
+  const sseSub = (profile.sseSub || '').trim()
+  const displayName = profile.name || (sseSub ? `用户${sseSub}` : `用户${sub.slice(0, 8)}`)
   const t = now()
   const s = db.getStore()
-  const existing = s.users.find((u) => u.oauth_id === oauthId)
-  const seedAdmin = config.platformAdminOauthIds.has(oauthId) ? 1 : 0
+
+  // 主键迁移：历史数据 oauth_id 存集市 userID；首次 UniSSO 登录时切换为 sub，
+  // 行内 id/余额/API Key/管理字段原样保留（sk-key、余额不动）。
+  let existing = s.users.find((u) => u.oauth_id === sub)
+  if (!existing && sseSub && !s.users.some((u) => u.oauth_id === sub)) {
+    const legacy = s.users.find((u) => u.oauth_id === sseSub)
+    if (legacy) {
+      legacy.oauth_id = sub
+      legacy.sse_user_id = sseSub
+      existing = legacy
+    }
+  }
+  if (!existing && sseSub) {
+    existing = s.users.find((u) => u.sse_user_id === sseSub)
+  }
+  const seedAdmin = config.platformAdminSubs.has(sub) ? 1 : 0
 
   if (!existing) {
     const user: UserRow = {
       id: db.nextId('users'),
-      oauth_id: oauthId,
-      name: profile.name || `用户${oauthId}`,
+      oauth_id: sub,
+      sse_user_id: sseSub,
+      name: displayName,
       email: profile.email || '',
       avatar_url: profile.avatar_url || '',
       is_admin: seedAdmin,
@@ -35,7 +53,8 @@ export async function upsertUserFromOAuth(profile: {
     return user
   }
 
-  existing.name = profile.name || existing.name
+  if (sseSub) existing.sse_user_id = sseSub
+  existing.name = displayName || existing.name
   existing.email = profile.email || existing.email
   existing.avatar_url = profile.avatar_url || existing.avatar_url
   existing.is_admin = existing.is_admin || seedAdmin
@@ -93,7 +112,7 @@ export async function setUserBalance(
     const delta = Math.round(balanceCents) - u.balance_cents
     u.balance_cents = Math.round(balanceCents)
     u.updated_at = now()
-    db.getStore().ledger.push({
+    db.insertLedger({
       id: db.nextId('ledger'),
       user_id: userId,
       kind: 'adjust',
@@ -125,7 +144,7 @@ export async function creditUser(
     if (next < 0) throw new Error('余额不足')
     u.balance_cents = next
     u.updated_at = now()
-    db.getStore().ledger.push({
+    db.insertLedger({
       id: db.nextId('ledger'),
       user_id: userId,
       kind,

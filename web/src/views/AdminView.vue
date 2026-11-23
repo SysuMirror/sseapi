@@ -87,7 +87,7 @@
             <button class="btn btn-ghost" type="button" :disabled="runtimeLoading" @click="loadRuntimeStatus">刷新</button>
           </div>
         </div>
-        <p class="hint">展示当前进程内处理中的请求，不含已完成请求；不是跨实例汇总。用户/模型上限 0 表示该层不限，实际请求仍受其他适用限额约束。全局总数不对应统一并发配额。</p>
+        <p class="hint">用户/模型/密钥的「当前」就是占着并发额度的请求，与限流闸门一致：某一层显示 0 时，请求不会被该层以并发为由拒绝（上限 0 表示该层不限）。统计当前进程、不含已完成请求，也不是跨实例汇总；全局总数不对应统一并发配额。</p>
 
         <p class="runtime-freshness muted" role="status">
           最后成功刷新：{{ runtimeLastSuccess ? runtimeLastSuccess.toLocaleString() : '尚无成功快照' }}
@@ -122,6 +122,12 @@
               <div class="rt-hero-item">
                 <div class="rt-hero-item-label">活跃端点</div>
                 <div class="rt-hero-item-num">{{ activeEndpoints.length }}</div>
+              </div>
+              <div v-if="runtime.defaults.maxConcurrent > 0" class="rt-hero-item">
+                <div class="rt-hero-item-label">默认层并发</div>
+                <div class="rt-hero-item-num">
+                  {{ runtime.defaults.current }}<span class="muted small"> / {{ runtime.defaults.maxConcurrent }}</span>
+                </div>
               </div>
             </div>
           </div>

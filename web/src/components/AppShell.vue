@@ -1,8 +1,19 @@
 <template>
   <div class="shell">
+    <div class="shell-decor" aria-hidden="true">
+      <div class="decor-aurora" />
+      <div class="decor-glow" />
+      <div class="decor-grid" />
+    </div>
+
     <aside class="side">
+      <div class="decor-side-glow" aria-hidden="true" />
       <div class="brand">
-        <img class="logo-mark" src="/logo.png" alt="SSE Market" width="36" height="36" />
+        <span class="logo-wrap">
+          <span class="decor-ring ring-outer" />
+          <span class="decor-ring dashed-soft ring-inner" />
+          <img class="logo-mark" src="/logo.png" alt="SSE Market" width="36" height="36" />
+        </span>
         <div>
           <div class="brand-name">SSE_Market</div>
           <div class="brand-tag">API 开发平台</div>
@@ -91,12 +102,15 @@ const icons = {
   models:
     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>',
   docs: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/></svg>',
+  playground:
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3 1.2-4A8 8 0 1 1 21 12z"/><path d="M9 11h6M9 14h4"/></svg>',
   admin:
     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>',
 }
 
 const userNav = [
   { to: '/', label: '概览', icon: icons.overview },
+  { to: '/playground', label: '对话', icon: icons.playground },
   { to: '/keys', label: 'API 密钥', icon: icons.keys },
   { to: '/usage', label: '用量', icon: icons.usage },
   { to: '/billing', label: '余额与流水', icon: icons.billing },
@@ -134,7 +148,13 @@ onMounted(async () => {
   await loadDocsLink()
 })
 
-function logout() {
+async function logout() {
+  // 先让服务端撤销 unisso 会话并清父域 Cookie；unissue 不可达时本地照常登出
+  try {
+    await api.logout()
+  } catch {
+    /* ignore */
+  }
   clearAuth()
   router.push({ name: 'login' })
 }
@@ -142,10 +162,22 @@ function logout() {
 
 <style scoped>
 .shell {
+  position: relative;
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
   min-height: 100vh;
   background: var(--bg);
+}
+/* 装饰层只铺在侧栏右侧的内容区，侧栏保持干净的白底 */
+.shell-decor {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: var(--sidebar-w);
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
 }
 .side {
   background: var(--sidebar);
@@ -158,19 +190,40 @@ function logout() {
   height: 100vh;
   border-right: 1px solid var(--line);
   z-index: 20;
+  overflow: hidden;
+}
+.side > *:not(.decor-side-glow) {
+  position: relative;
+  z-index: 1;
 }
 .brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 6px 8px var(--sp-5);
+  gap: 13px;
+  padding: 10px 8px var(--sp-5);
+}
+/* 品牌标外围两圈反向旋转的虚线环 */
+.logo-wrap {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
 }
 .logo-mark {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   object-fit: contain;
   display: block;
   flex-shrink: 0;
+  animation: float-y 6s var(--ease) infinite;
+}
+.ring-outer {
+  inset: 0;
+}
+.ring-inner {
+  inset: 6px;
 }
 .brand-name {
   color: var(--ink-strong);
@@ -225,9 +278,28 @@ function logout() {
   box-shadow: none;
 }
 .nav-item.router-link-active {
-  background: var(--sidebar-active-bg);
+  /* 背景带自身做横向流动，避免用位移的 ::after —— 那会溢出到侧栏外面 */
+  background-image: linear-gradient(
+    100deg,
+    rgba(var(--brand-rgb), 0.11) 0%,
+    rgba(var(--brand-rgb), 0.05) 42%,
+    rgba(var(--brand-rgb), 0.2) 50%,
+    rgba(var(--brand-rgb), 0.05) 58%,
+    rgba(var(--brand-rgb), 0.11) 100%
+  );
+  background-size: 260% 100%;
   color: var(--sidebar-active);
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(var(--brand-rgb), 0.14);
+  animation: nav-flow 7s linear infinite;
+}
+@keyframes nav-flow {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
 }
 .nav-item.router-link-active::before {
   content: '';
@@ -239,6 +311,7 @@ function logout() {
   height: 18px;
   border-radius: 0 3px 3px 0;
   background: var(--brand);
+  box-shadow: 0 0 10px rgba(var(--brand-rgb), 0.6);
 }
 .nav-item.router-link-active .nav-icon {
   opacity: 1;
@@ -315,6 +388,8 @@ function logout() {
   background: var(--sidebar-hover) !important;
 }
 .main {
+  position: relative;
+  z-index: 1;
   padding: var(--sp-8) var(--sp-8) 72px;
   max-width: 1180px;
   width: 100%;
@@ -324,11 +399,15 @@ function logout() {
   .shell {
     grid-template-columns: 1fr;
   }
+  .shell-decor {
+    left: 0;
+  }
   .side {
     position: relative;
     height: auto;
     border-right: none;
     border-bottom: 1px solid var(--line);
+    z-index: 20;
   }
   .nav {
     flex-direction: row;
